@@ -1,0 +1,72 @@
+// Lighthouse on Cron uses direct SQL via pg (no Prisma runtime).
+// This file documents the relational model for reference in teams that use Prisma Studio locally.
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+model User {
+  id                 Int            @id @default(autoincrement())
+  email              String         @unique
+  plan               String         @default("starter")
+  urlsLimit          Int            @default(10) @map("urls_limit")
+  subscriptionStatus String         @default("inactive") @map("subscription_status")
+  lemonCustomerId    String?        @map("lemon_customer_id")
+  lemonSubscriptionId String?       @map("lemon_subscription_id")
+  accessToken        String?        @map("access_token")
+  accessTokenExpires DateTime?      @map("access_token_expires")
+  createdAt          DateTime       @default(now()) @map("created_at")
+  updatedAt          DateTime       @updatedAt @map("updated_at")
+  monitoredUrls      MonitoredUrl[]
+  lighthouseRuns     LighthouseRun[]
+
+  @@map("users")
+}
+
+model MonitoredUrl {
+  id         Int            @id @default(autoincrement())
+  userId     Int            @map("user_id")
+  url        String
+  createdAt  DateTime       @default(now()) @map("created_at")
+  user       User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  runs       LighthouseRun[]
+
+  @@unique([userId, url])
+  @@map("monitored_urls")
+}
+
+model LighthouseRun {
+  id            Int               @id @default(autoincrement())
+  userId        Int               @map("user_id")
+  monitoredUrlId Int              @map("monitored_url_id")
+  url           String
+  performance   Int
+  accessibility Int
+  seo           Int
+  bestPractices Int               @map("best_practices")
+  runAt         DateTime          @default(now()) @map("run_at")
+  reportJson    Json              @map("report_json")
+  user          User              @relation(fields: [userId], references: [id], onDelete: Cascade)
+  monitoredUrl  MonitoredUrl      @relation(fields: [monitoredUrlId], references: [id], onDelete: Cascade)
+  alerts        RegressionAlert[]
+
+  @@map("lighthouse_runs")
+}
+
+model RegressionAlert {
+  id            Int           @id @default(autoincrement())
+  runId         Int           @map("run_id")
+  category      String
+  previousScore Int           @map("previous_score")
+  currentScore  Int           @map("current_score")
+  delta         Int
+  createdAt     DateTime      @default(now()) @map("created_at")
+  run           LighthouseRun @relation(fields: [runId], references: [id], onDelete: Cascade)
+
+  @@map("regression_alerts")
+}
