@@ -1,606 +1,486 @@
-import crypto from "crypto";
-import { Pool, type QueryResult, type QueryResultRow } from "pg";
+import { Pool } from "pg";
 
-export const ACCESS_COOKIE_NAME = "lighthouse_access";
+type PlanName = "starter" | "unlimited";
 
-export type PlanType = "starter" | "unlimited";
+type SubscriptionStatus = "active" | "on_trial" | "paused" | "cancelled" | "expired" | "past_due";
 
-type DbUserRow = {
-  id: number;
-  email: string;
-  plan: PlanType;
-  urls_limit: number;
-  subscription_status: string;
-  access_token: string | null;
-  access_token_expires: Date | null;
-};
+let pool: Pool | null = null;
+let schemaPromise: Promise<void> | null = null;
 
-type MonitoredUrlRow = {
-  id: number;
-  user_id: number;
-  url: string;
-  created_at: Date;
-};
-
-type LighthouseRunRow = {
-  id: number;
-  monitored_url_id: number;
-  url: string;
-  performance: number;
-  accessibility: number;
-  seo: number;
-  best_practices: number;
-  run_at: Date;
-};
-
-type RegressionAlertRow = {
-  category: "performance" | "accessibility" | "seo" | "best_practices";
-  previous_score: number;
-  current_score: number;
-  delta: number;
-};
-
-export type DashboardReport = {
-  urlId: number;
-  url: string;
-  latest: {
-    runAt: string;
-    performance: number;
-    accessibility: number;
-    seo: number;
-    bestPractices: number;
-  } | null;
-  history: Array<{
-    runAt: string;
-    performance: number;
-    accessibility: number;
-    seo: number;
-    bestPractices: number;
-  }>;
-};
-
-export type DashboardData = {
-  user: {
-    id: number;
-    email: string;
-    plan: PlanType;
-    urlLimit: number;
-    urlCount: number;
-  };
-  urls: Array<{
-    id: number;
-    url: string;
-    createdAt: string;
-  }>;
-  reports: DashboardReport[];
-};
-
-type CreateRunInput = {
-  userId: number;
-  monitoredUrlId: number;
-  url: string;
-  performance: number;
-  accessibility: number;
-  seo: number;
-  bestPractices: number;
-  reportJson: unknown;
-};
-
-const ACTIVE_SUBSCRIPTION_STATUSES = new Set(["active", "on_trial", "paid"]);
-const ACCESS_TOKEN_TTL_DAYS = 30;
-
-const globalForDb = globalThis as unknown as {
-  lighthousePool?: Pool;
-  lighthouseSchemaReady?: boolean;
-  lighthouseSchemaPromise?: Promise<void>;
-};
-
-function getDatabaseUrl() {
-  const connectionString = process.env.DATABASE_URL;
-  if (!connectionString) {
-    throw new Error("DATABASE_URL is required to use Lighthouse on Cron.");
-  }
-  return connectionString;
+function isProd() {
+  return process.env.NODE_ENV === "production";
 }
 
 function getPool() {
-  if (!globalForDb.lighthousePool) {
-    globalForDb.lighthousePool = new Pool({
-      connectionString: getDatabaseUrl(),
-      ssl:
-        process.env.NODE_ENV === "production"
-          ? {
-              rejectUnauthorized: false
-            }
-          : undefined
+  const connectionString = process.env.DATABASE_URL;
+  if (!connectionString) {
+    throw new Error("DATABASE_URL is required for persistence.");
+  }
+
+  if (!pool) {
+    pool = new Pool({
+      connectionString,
+      ssl: isProd() ? { rejectUnauthorized: false } : undefined
     });
   }
 
-  return globalForDb.lighthousePool;
+  return pool;
 }
 
-async function query<T extends QueryResultRow>(text: string, params: unknown[] = []): Promise<QueryResult<T>> {
-  await ensureSchema();
-  return getPool().query<T>(text, params);
-}
+async function ensureSchema() {
+  if (!schemaPromise) {
+    schemaPromise = (async () => {
+      const db = getPool();
 
-export async function ensureSchema() {
-  if (globalForDb.lighthouseSchemaReady) {
-    return;
-  }
-
-  if (!globalForDb.lighthouseSchemaPromise) {
-    globalForDb.lighthouseSchemaPromise = (async () => {
-      const pool = getPool();
-      await pool.query(`
+      await db.query(`
         CREATE TABLE IF NOT EXISTS users (
-          id SERIAL PRIMARY KEY,
-          email TEXT UNIQUE NOT NULL,
+          id BIGSERIAL PRIMARY KEY,
+          email TEXT NOT NULL UNIQUE,
           plan TEXT NOT NULL DEFAULT 'starter',
-          urls_limit INTEGER NOT NULL DEFAULT 10,
-          subscription_status TEXT NOT NULL DEFAULT 'inactive',
-          lemon_customer_id TEXT,
-          lemon_subscription_id TEXT,
-          access_token TEXT,
-          access_token_expires TIMESTAMPTZ,
           created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
           updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
         );
+      `);
 
-        CREATE TABLE IF NOT EXISTS monitored_urls (
-          id SERIAL PRIMARY KEY,
-          user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-          url TEXT NOT NULL,
-          created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-          UNIQUE(user_id, url)
+      await db.query(`
+        CREATE TABLE IF NOT EXISTS subscriptions (
+          id BIGSERIAL PRIMARY KEY,
+          lemon_subscription_id TEXT NOT NULL UNIQUE,
+          user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+          status TEXT NOT NULL,
+          plan TEXT NOT NULL,
+          current_period_end TIMESTAMPTZ NULL,
+          updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
         );
+      `);
 
-        CREATE TABLE IF NOT EXISTS lighthouse_runs (
-          id SERIAL PRIMARY KEY,
-          user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-          monitored_url_id INTEGER NOT NULL REFERENCES monitored_urls(id) ON DELETE CASCADE,
+      await db.query(`
+        CREATE TABLE IF NOT EXISTS tracked_urls (
+          id BIGSERIAL PRIMARY KEY,
+          user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
           url TEXT NOT NULL,
+          normalized_url TEXT NOT NULL,
+          active BOOLEAN NOT NULL DEFAULT TRUE,
+          created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          UNIQUE(user_id, normalized_url)
+        );
+      `);
+
+      await db.query(`
+        CREATE TABLE IF NOT EXISTS audit_runs (
+          id BIGSERIAL PRIMARY KEY,
+          tracked_url_id BIGINT NOT NULL REFERENCES tracked_urls(id) ON DELETE CASCADE,
+          run_week DATE NOT NULL,
           performance INTEGER NOT NULL,
           accessibility INTEGER NOT NULL,
           seo INTEGER NOT NULL,
           best_practices INTEGER NOT NULL,
-          run_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-          report_json JSONB NOT NULL DEFAULT '{}'::jsonb
+          raw_json JSONB NULL,
+          created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          UNIQUE(tracked_url_id, run_week)
         );
-
-        CREATE TABLE IF NOT EXISTS regression_alerts (
-          id SERIAL PRIMARY KEY,
-          run_id INTEGER NOT NULL REFERENCES lighthouse_runs(id) ON DELETE CASCADE,
-          category TEXT NOT NULL,
-          previous_score INTEGER NOT NULL,
-          current_score INTEGER NOT NULL,
-          delta INTEGER NOT NULL,
-          created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-        );
-
-        CREATE INDEX IF NOT EXISTS idx_users_subscription_status ON users(subscription_status);
-        CREATE INDEX IF NOT EXISTS idx_users_access_token ON users(access_token);
-        CREATE INDEX IF NOT EXISTS idx_monitored_urls_user_id ON monitored_urls(user_id);
-        CREATE INDEX IF NOT EXISTS idx_lighthouse_runs_user_id ON lighthouse_runs(user_id);
-        CREATE INDEX IF NOT EXISTS idx_lighthouse_runs_monitored_url_id ON lighthouse_runs(monitored_url_id);
-        CREATE INDEX IF NOT EXISTS idx_lighthouse_runs_run_at ON lighthouse_runs(run_at DESC);
       `);
-      globalForDb.lighthouseSchemaReady = true;
+
+      await db.query(`
+        CREATE TABLE IF NOT EXISTS app_state (
+          key TEXT PRIMARY KEY,
+          value TEXT NOT NULL,
+          updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );
+      `);
+
+      await db.query("CREATE INDEX IF NOT EXISTS idx_urls_user_active ON tracked_urls(user_id, active);");
+      await db.query("CREATE INDEX IF NOT EXISTS idx_audit_runs_url_week ON audit_runs(tracked_url_id, run_week DESC);");
+      await db.query("CREATE INDEX IF NOT EXISTS idx_subscriptions_user_status ON subscriptions(user_id, status);");
     })();
   }
 
-  await globalForDb.lighthouseSchemaPromise;
+  return schemaPromise;
 }
 
-export function inferPlan(variantName: string | null | undefined): PlanType {
-  if (!variantName) return "starter";
-  return variantName.toLowerCase().includes("unlimited") ? "unlimited" : "starter";
-}
-
-function urlLimitFromPlan(plan: PlanType) {
-  return plan === "unlimited" ? 10000 : 10;
-}
-
-function normalizeEmail(email: string) {
-  return email.trim().toLowerCase();
-}
-
-function normalizeUrl(input: string) {
-  const trimmed = input.trim();
-  const withProtocol = /^https?:\/\//i.test(trimmed) ? trimmed : `https://${trimmed}`;
-  const parsed = new URL(withProtocol);
+export function normalizeUrl(raw: string) {
+  const withProtocol = raw.startsWith("http://") || raw.startsWith("https://") ? raw : `https://${raw}`;
+  const parsed = new URL(withProtocol.trim());
   parsed.hash = "";
-  return parsed.toString().replace(/\/$/, "");
+  if (parsed.pathname.endsWith("/")) {
+    parsed.pathname = parsed.pathname.slice(0, -1) || "/";
+  }
+  return parsed.toString();
 }
 
-function generateAccessToken() {
-  return crypto.randomBytes(24).toString("hex");
+function mapPlan(input: string | null | undefined): PlanName {
+  const value = (input ?? "").toLowerCase();
+  if (value.includes("unlimited") || value.includes("agency") || value.includes("29")) {
+    return "unlimited";
+  }
+  return "starter";
 }
 
-function accessTokenExpiryDate() {
-  const expiresAt = new Date();
-  expiresAt.setDate(expiresAt.getDate() + ACCESS_TOKEN_TTL_DAYS);
-  return expiresAt;
+function isActiveSubscription(status: string) {
+  return status === "active" || status === "on_trial";
 }
 
-async function issueAccessTokenByUserId(userId: number) {
-  const token = generateAccessToken();
-  const expiresAt = accessTokenExpiryDate();
+async function getOrCreateUser(email: string, plan: PlanName = "starter") {
+  await ensureSchema();
+  const db = getPool();
+  const normalizedEmail = email.trim().toLowerCase();
 
-  await query(
+  const result = await db.query<{ id: string; email: string; plan: PlanName }>(
     `
-    UPDATE users
-    SET access_token = $2,
-        access_token_expires = $3,
+      INSERT INTO users(email, plan, updated_at)
+      VALUES($1, $2, NOW())
+      ON CONFLICT(email) DO UPDATE SET
+        plan = EXCLUDED.plan,
         updated_at = NOW()
-    WHERE id = $1
-  `,
-    [userId, token, expiresAt]
+      RETURNING id, email, plan;
+    `,
+    [normalizedEmail, plan]
   );
 
-  return { token, expiresAt };
+  return {
+    id: Number(result.rows[0].id),
+    email: result.rows[0].email,
+    plan: result.rows[0].plan
+  };
 }
 
 export async function upsertSubscriptionFromWebhook(input: {
   email: string;
-  subscriptionStatus: string;
-  plan: PlanType;
-  lemonCustomerId?: string | null;
-  lemonSubscriptionId?: string | null;
+  lemonSubscriptionId: string;
+  status: SubscriptionStatus;
+  planLabel?: string | null;
+  currentPeriodEnd?: string | null;
 }) {
-  const normalizedEmail = normalizeEmail(input.email);
-  const urlsLimit = urlLimitFromPlan(input.plan);
+  await ensureSchema();
+  const db = getPool();
+  const plan = mapPlan(input.planLabel);
+  const user = await getOrCreateUser(input.email, plan);
 
-  const upserted = await query<DbUserRow>(
+  await db.query(
     `
-    INSERT INTO users (
-      email,
-      plan,
-      urls_limit,
-      subscription_status,
-      lemon_customer_id,
-      lemon_subscription_id
-    ) VALUES ($1, $2, $3, $4, $5, $6)
-    ON CONFLICT(email)
-    DO UPDATE SET
-      plan = EXCLUDED.plan,
-      urls_limit = EXCLUDED.urls_limit,
-      subscription_status = EXCLUDED.subscription_status,
-      lemon_customer_id = COALESCE(EXCLUDED.lemon_customer_id, users.lemon_customer_id),
-      lemon_subscription_id = COALESCE(EXCLUDED.lemon_subscription_id, users.lemon_subscription_id),
-      updated_at = NOW()
-    RETURNING id, email, plan, urls_limit, subscription_status, access_token, access_token_expires
-  `,
-    [
-      normalizedEmail,
-      input.plan,
-      urlsLimit,
-      input.subscriptionStatus,
-      input.lemonCustomerId ?? null,
-      input.lemonSubscriptionId ?? null
-    ]
+      INSERT INTO subscriptions(lemon_subscription_id, user_id, status, plan, current_period_end, updated_at)
+      VALUES($1, $2, $3, $4, $5, NOW())
+      ON CONFLICT(lemon_subscription_id)
+      DO UPDATE SET
+        status = EXCLUDED.status,
+        plan = EXCLUDED.plan,
+        current_period_end = EXCLUDED.current_period_end,
+        updated_at = NOW();
+    `,
+    [input.lemonSubscriptionId, user.id, input.status, plan, input.currentPeriodEnd ?? null]
   );
 
-  const user = upserted.rows[0];
-  if (!user) {
-    throw new Error("Unable to create or update subscriber record.");
-  }
-
-  if (ACTIVE_SUBSCRIPTION_STATUSES.has(input.subscriptionStatus)) {
-    if (!user.access_token || !user.access_token_expires || user.access_token_expires < new Date()) {
-      await issueAccessTokenByUserId(user.id);
-    }
-  }
-
-  return user;
+  await db.query("UPDATE users SET plan = $1, updated_at = NOW() WHERE id = $2", [plan, user.id]);
 }
 
-export async function verifyPurchasedEmailAndIssueToken(email: string) {
-  const normalizedEmail = normalizeEmail(email);
-
-  const result = await query<DbUserRow>(
+export async function findActiveSubscriptionByEmail(email: string) {
+  await ensureSchema();
+  const db = getPool();
+  const result = await db.query<{
+    email: string;
+    plan: PlanName;
+    status: string;
+    current_period_end: string | null;
+  }>(
     `
-    SELECT id, email, plan, urls_limit, subscription_status, access_token, access_token_expires
-    FROM users
-    WHERE email = $1
-      AND subscription_status = ANY($2::text[])
-    LIMIT 1
-  `,
-    [normalizedEmail, [...ACTIVE_SUBSCRIPTION_STATUSES]]
+      SELECT u.email, s.plan, s.status, s.current_period_end
+      FROM users u
+      JOIN subscriptions s ON s.user_id = u.id
+      WHERE u.email = $1
+      ORDER BY s.updated_at DESC
+      LIMIT 1;
+    `,
+    [email.trim().toLowerCase()]
   );
 
-  const user = result.rows[0];
-  if (!user) {
+  if (result.rowCount === 0) {
     return null;
   }
 
-  return issueAccessTokenByUserId(user.id);
-}
-
-export async function getUserByAccessToken(token: string) {
-  const result = await query<DbUserRow>(
-    `
-    SELECT id, email, plan, urls_limit, subscription_status, access_token, access_token_expires
-    FROM users
-    WHERE access_token = $1
-      AND access_token_expires > NOW()
-      AND subscription_status = ANY($2::text[])
-    LIMIT 1
-  `,
-    [token, [...ACTIVE_SUBSCRIPTION_STATUSES]]
-  );
-
-  return result.rows[0] ?? null;
-}
-
-export async function addMonitoredUrl(userId: number, url: string) {
-  const normalizedUrl = normalizeUrl(url);
-
-  const limitsResult = await query<{ urls_limit: number }>(
-    `
-    SELECT urls_limit
-    FROM users
-    WHERE id = $1
-    LIMIT 1
-  `,
-    [userId]
-  );
-
-  const limit = limitsResult.rows[0]?.urls_limit;
-  if (!limit) {
-    throw new Error("User record not found.");
-  }
-
-  const countResult = await query<{ count: string }>(
-    `
-    SELECT COUNT(*)::text AS count
-    FROM monitored_urls
-    WHERE user_id = $1
-  `,
-    [userId]
-  );
-
-  const currentCount = Number(countResult.rows[0]?.count ?? 0);
-  if (currentCount >= limit) {
-    throw new Error(`Plan limit reached. Your plan supports ${limit} URLs.`);
-  }
-
-  const insertResult = await query<MonitoredUrlRow>(
-    `
-    INSERT INTO monitored_urls (user_id, url)
-    VALUES ($1, $2)
-    ON CONFLICT(user_id, url)
-    DO UPDATE SET url = EXCLUDED.url
-    RETURNING id, user_id, url, created_at
-  `,
-    [userId, normalizedUrl]
-  );
-
-  const row = insertResult.rows[0];
+  const row = result.rows[0];
   return {
-    id: row.id,
-    url: row.url,
-    createdAt: row.created_at.toISOString()
+    email: row.email,
+    plan: row.plan,
+    status: row.status,
+    currentPeriodEnd: row.current_period_end,
+    active: isActiveSubscription(row.status)
   };
 }
 
-export async function removeMonitoredUrl(userId: number, urlId: number) {
-  await query(
-    `
-    DELETE FROM monitored_urls
-    WHERE id = $1 AND user_id = $2
-  `,
-    [urlId, userId]
-  );
+export async function getUrlLimitForEmail(email: string) {
+  const subscription = await findActiveSubscriptionByEmail(email);
+  if (!subscription || !subscription.active) {
+    return 0;
+  }
+  return subscription.plan === "unlimited" ? Number.POSITIVE_INFINITY : 10;
 }
 
-export async function listMonitoredUrls(userId: number) {
-  const result = await query<MonitoredUrlRow>(
+export async function listTrackedUrlsByEmail(email: string) {
+  await ensureSchema();
+  const db = getPool();
+  const rows = await db.query<{ id: string; url: string; created_at: string }>(
     `
-    SELECT id, user_id, url, created_at
-    FROM monitored_urls
-    WHERE user_id = $1
-    ORDER BY created_at DESC
-  `,
-    [userId]
+      SELECT t.id, t.url, t.created_at
+      FROM tracked_urls t
+      JOIN users u ON u.id = t.user_id
+      WHERE u.email = $1 AND t.active = TRUE
+      ORDER BY t.created_at DESC;
+    `,
+    [email.trim().toLowerCase()]
   );
 
-  return result.rows.map((row) => ({
-    id: row.id,
+  return rows.rows.map((row) => ({
+    id: Number(row.id),
     url: row.url,
-    createdAt: row.created_at.toISOString()
+    createdAt: row.created_at
   }));
 }
 
-export async function getDashboardData(userId: number): Promise<DashboardData> {
-  const [userResult, urlsResult, runsResult] = await Promise.all([
-    query<DbUserRow>(
-      `
-      SELECT id, email, plan, urls_limit, subscription_status, access_token, access_token_expires
-      FROM users
-      WHERE id = $1
-      LIMIT 1
-    `,
-      [userId]
-    ),
-    query<MonitoredUrlRow>(
-      `
-      SELECT id, user_id, url, created_at
-      FROM monitored_urls
-      WHERE user_id = $1
-      ORDER BY created_at DESC
-    `,
-      [userId]
-    ),
-    query<LighthouseRunRow>(
-      `
-      SELECT id, monitored_url_id, url, performance, accessibility, seo, best_practices, run_at
-      FROM lighthouse_runs
-      WHERE user_id = $1
-      ORDER BY run_at DESC
-      LIMIT 800
-    `,
-      [userId]
-    )
-  ]);
+export async function addTrackedUrlByEmail(email: string, url: string) {
+  await ensureSchema();
+  const db = getPool();
+  const normalized = normalizeUrl(url);
+  const sub = await findActiveSubscriptionByEmail(email);
 
-  const user = userResult.rows[0];
-  if (!user) {
-    throw new Error("Unable to load dashboard user context.");
+  if (!sub || !sub.active) {
+    throw new Error("Active subscription required to track URLs.");
   }
 
-  const urls = urlsResult.rows.map((row) => ({
-    id: row.id,
-    url: row.url,
-    createdAt: row.created_at.toISOString()
-  }));
+  const maxUrls = sub.plan === "unlimited" ? Number.POSITIVE_INFINITY : 10;
+  const user = await getOrCreateUser(email, sub.plan);
 
-  const historyByUrl = new Map<number, DashboardReport["history"]>();
-  for (const run of runsResult.rows) {
-    const existing = historyByUrl.get(run.monitored_url_id) ?? [];
-    if (existing.length < 12) {
-      existing.push({
-        runAt: run.run_at.toISOString(),
-        performance: run.performance,
-        accessibility: run.accessibility,
-        seo: run.seo,
-        bestPractices: run.best_practices
-      });
-      historyByUrl.set(run.monitored_url_id, existing);
+  if (Number.isFinite(maxUrls)) {
+    const count = await db.query<{ count: string }>(
+      "SELECT COUNT(*)::text AS count FROM tracked_urls WHERE user_id = $1 AND active = TRUE",
+      [user.id]
+    );
+
+    if (Number(count.rows[0].count) >= maxUrls) {
+      throw new Error("Starter plan reached the 10 URL limit. Upgrade for unlimited URLs.");
     }
   }
 
-  const reports: DashboardReport[] = urls.map((urlRow) => {
-    const history = (historyByUrl.get(urlRow.id) ?? []).sort((a, b) => a.runAt.localeCompare(b.runAt));
-    const latest = history[history.length - 1] ?? null;
-    return {
-      urlId: urlRow.id,
-      url: urlRow.url,
-      latest,
-      history
-    };
-  });
+  const inserted = await db.query<{ id: string; url: string; created_at: string }>(
+    `
+      INSERT INTO tracked_urls(user_id, url, normalized_url, active)
+      VALUES($1, $2, $3, TRUE)
+      ON CONFLICT(user_id, normalized_url)
+      DO UPDATE SET active = TRUE
+      RETURNING id, url, created_at;
+    `,
+    [user.id, normalized, normalized]
+  );
 
   return {
-    user: {
-      id: user.id,
-      email: user.email,
-      plan: user.plan,
-      urlLimit: user.urls_limit,
-      urlCount: urls.length
-    },
-    urls,
-    reports
+    id: Number(inserted.rows[0].id),
+    url: inserted.rows[0].url,
+    createdAt: inserted.rows[0].created_at
   };
 }
 
-export async function getActiveUsersWithUrls() {
-  const result = await query<{ id: number; email: string; plan: PlanType }>(
-    `
-    SELECT DISTINCT u.id, u.email, u.plan
-    FROM users u
-    INNER JOIN monitored_urls mu ON mu.user_id = u.id
-    WHERE u.subscription_status = ANY($1::text[])
-    ORDER BY u.id ASC
-  `,
-    [[...ACTIVE_SUBSCRIPTION_STATUSES]]
-  );
+export async function removeTrackedUrlByEmail(email: string, urlId: number) {
+  await ensureSchema();
+  const db = getPool();
+  const user = await db.query<{ id: string }>("SELECT id FROM users WHERE email = $1", [email.trim().toLowerCase()]);
 
-  return result.rows;
-}
-
-export async function getUrlsForUser(userId: number) {
-  const result = await query<MonitoredUrlRow>(
-    `
-    SELECT id, user_id, url, created_at
-    FROM monitored_urls
-    WHERE user_id = $1
-    ORDER BY created_at ASC
-  `,
-    [userId]
-  );
-
-  return result.rows;
-}
-
-export async function getLatestRunForMonitoredUrl(monitoredUrlId: number) {
-  const result = await query<LighthouseRunRow>(
-    `
-    SELECT id, monitored_url_id, url, performance, accessibility, seo, best_practices, run_at
-    FROM lighthouse_runs
-    WHERE monitored_url_id = $1
-    ORDER BY run_at DESC
-    LIMIT 1
-  `,
-    [monitoredUrlId]
-  );
-
-  return result.rows[0] ?? null;
-}
-
-export async function createLighthouseRun(input: CreateRunInput) {
-  const result = await query<{ id: number }>(
-    `
-    INSERT INTO lighthouse_runs (
-      user_id,
-      monitored_url_id,
-      url,
-      performance,
-      accessibility,
-      seo,
-      best_practices,
-      report_json
-    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb)
-    RETURNING id
-  `,
-    [
-      input.userId,
-      input.monitoredUrlId,
-      input.url,
-      input.performance,
-      input.accessibility,
-      input.seo,
-      input.bestPractices,
-      JSON.stringify(input.reportJson)
-    ]
-  );
-
-  return result.rows[0]?.id;
-}
-
-export async function createRegressionAlerts(runId: number, alerts: RegressionAlertRow[]) {
-  if (alerts.length === 0) {
-    return;
+  if (!user.rowCount) {
+    return false;
   }
 
-  const values: string[] = [];
-  const params: Array<number | string> = [];
+  const result = await db.query("UPDATE tracked_urls SET active = FALSE WHERE id = $1 AND user_id = $2", [
+    urlId,
+    Number(user.rows[0].id)
+  ]);
 
-  alerts.forEach((alert, index) => {
-    const offset = index * 4;
-    values.push(`($1, $${offset + 2}, $${offset + 3}, $${offset + 4}, $${offset + 5})`);
-    params.push(alert.category, alert.previous_score, alert.current_score, alert.delta);
-  });
+  return result.rowCount > 0;
+}
 
-  await query(
+export type WeeklyAuditInsert = {
+  trackedUrlId: number;
+  runWeek: string;
+  performance: number;
+  accessibility: number;
+  seo: number;
+  bestPractices: number;
+  rawJson?: unknown;
+};
+
+export async function upsertAuditRun(payload: WeeklyAuditInsert) {
+  await ensureSchema();
+  const db = getPool();
+
+  await db.query(
     `
-    INSERT INTO regression_alerts (run_id, category, previous_score, current_score, delta)
-    VALUES ${values.join(",")}
-  `,
-    [runId, ...params]
+      INSERT INTO audit_runs(tracked_url_id, run_week, performance, accessibility, seo, best_practices, raw_json)
+      VALUES($1, $2, $3, $4, $5, $6, $7)
+      ON CONFLICT(tracked_url_id, run_week)
+      DO UPDATE SET
+        performance = EXCLUDED.performance,
+        accessibility = EXCLUDED.accessibility,
+        seo = EXCLUDED.seo,
+        best_practices = EXCLUDED.best_practices,
+        raw_json = EXCLUDED.raw_json;
+    `,
+    [
+      payload.trackedUrlId,
+      payload.runWeek,
+      payload.performance,
+      payload.accessibility,
+      payload.seo,
+      payload.bestPractices,
+      payload.rawJson ? JSON.stringify(payload.rawJson) : null
+    ]
   );
 }
 
-export async function getRunAlerts(runId: number) {
-  const result = await query<RegressionAlertRow>(
+export async function getLatestTwoAuditRunsForUrl(trackedUrlId: number) {
+  await ensureSchema();
+  const db = getPool();
+  const rows = await db.query<{
+    run_week: string;
+    performance: number;
+    accessibility: number;
+    seo: number;
+    best_practices: number;
+    created_at: string;
+  }>(
     `
-    SELECT category, previous_score, current_score, delta
-    FROM regression_alerts
-    WHERE run_id = $1
-    ORDER BY id ASC
-  `,
-    [runId]
+      SELECT run_week, performance, accessibility, seo, best_practices, created_at
+      FROM audit_runs
+      WHERE tracked_url_id = $1
+      ORDER BY run_week DESC
+      LIMIT 2;
+    `,
+    [trackedUrlId]
   );
 
-  return result.rows;
+  return rows.rows.map((row) => ({
+    runWeek: row.run_week,
+    performance: Number(row.performance),
+    accessibility: Number(row.accessibility),
+    seo: Number(row.seo),
+    bestPractices: Number(row.best_practices),
+    createdAt: row.created_at
+  }));
+}
+
+export async function getDashboardReportByEmail(email: string) {
+  const urls = await listTrackedUrlsByEmail(email);
+  const reportRows = await Promise.all(
+    urls.map(async (urlRow) => {
+      const runs = await getLatestTwoAuditRunsForUrl(urlRow.id);
+      const current = runs[0] ?? null;
+      const previous = runs[1] ?? null;
+
+      return {
+        trackedUrlId: urlRow.id,
+        url: urlRow.url,
+        current,
+        previous
+      };
+    })
+  );
+
+  return reportRows;
+}
+
+export async function getWeeklyCronTargets() {
+  await ensureSchema();
+  const db = getPool();
+  const rows = await db.query<{
+    user_id: string;
+    email: string;
+    plan: PlanName;
+    tracked_url_id: string;
+    url: string;
+  }>(
+    `
+      SELECT u.id AS user_id, u.email, s.plan, t.id AS tracked_url_id, t.url
+      FROM users u
+      JOIN subscriptions s ON s.user_id = u.id
+      JOIN tracked_urls t ON t.user_id = u.id
+      WHERE t.active = TRUE
+      AND s.status IN ('active', 'on_trial')
+      ORDER BY u.email ASC, t.created_at ASC;
+    `
+  );
+
+  const users = new Map<
+    string,
+    { userId: number; email: string; plan: PlanName; urls: Array<{ trackedUrlId: number; url: string }> }
+  >();
+
+  for (const row of rows.rows) {
+    const key = row.email;
+    if (!users.has(key)) {
+      users.set(key, {
+        userId: Number(row.user_id),
+        email: row.email,
+        plan: row.plan,
+        urls: []
+      });
+    }
+
+    users.get(key)?.urls.push({
+      trackedUrlId: Number(row.tracked_url_id),
+      url: row.url
+    });
+  }
+
+  return [...users.values()];
+}
+
+export async function getPreviousAuditBeforeWeek(trackedUrlId: number, week: string) {
+  await ensureSchema();
+  const db = getPool();
+  const row = await db.query<{
+    run_week: string;
+    performance: number;
+    accessibility: number;
+    seo: number;
+    best_practices: number;
+  }>(
+    `
+      SELECT run_week, performance, accessibility, seo, best_practices
+      FROM audit_runs
+      WHERE tracked_url_id = $1 AND run_week < $2
+      ORDER BY run_week DESC
+      LIMIT 1;
+    `,
+    [trackedUrlId, week]
+  );
+
+  if (!row.rowCount) {
+    return null;
+  }
+
+  const item = row.rows[0];
+  return {
+    runWeek: item.run_week,
+    performance: Number(item.performance),
+    accessibility: Number(item.accessibility),
+    seo: Number(item.seo),
+    bestPractices: Number(item.best_practices)
+  };
+}
+
+export async function getLastCronWeek() {
+  await ensureSchema();
+  const db = getPool();
+  const result = await db.query<{ value: string }>("SELECT value FROM app_state WHERE key = 'last_cron_week'");
+  return result.rowCount ? result.rows[0].value : null;
+}
+
+export async function setLastCronWeek(week: string) {
+  await ensureSchema();
+  const db = getPool();
+  await db.query(
+    `
+      INSERT INTO app_state(key, value, updated_at)
+      VALUES('last_cron_week', $1, NOW())
+      ON CONFLICT(key)
+      DO UPDATE SET value = EXCLUDED.value, updated_at = NOW();
+    `,
+    [week]
+  );
 }

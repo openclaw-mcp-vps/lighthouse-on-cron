@@ -11,22 +11,21 @@ NICHE: performance
 PRICE: $$9/mo for 10 URLs, $29/mo unlimited/mo
 
 ARCHITECTURE SPEC:
-A Next.js app with cron jobs that runs weekly Lighthouse audits on user URLs, stores results in a database, and sends email reports with performance regression alerts. Uses Lemon Squeezy for subscriptions and Resend for email delivery.
+Next.js app with cron jobs that run Lighthouse audits on user URLs every Sunday, stores results in database, and sends email reports with performance regression alerts. Uses Lemon Squeezy for subscriptions and Resend for email delivery.
 
 PLANNED FILES:
 - app/page.tsx
 - app/dashboard/page.tsx
-- app/api/webhooks/lemonsqueezy/route.ts
+- app/api/webhooks/lemon-squeezy/route.ts
 - app/api/cron/lighthouse/route.ts
-- components/url-manager.tsx
-- components/lighthouse-report.tsx
 - lib/lighthouse.ts
 - lib/email.ts
 - lib/db.ts
-- prisma/schema.prisma
-- emails/weekly-report.tsx
+- components/url-manager.tsx
+- components/pricing.tsx
+- components/report-viewer.tsx
 
-DEPENDENCIES: next, tailwindcss, prisma, @prisma/client, lighthouse, chrome-launcher, resend, @react-email/components, @lemonsqueezy/lemonsqueezy.js, recharts, lucide-react
+DEPENDENCIES: next, tailwindcss, prisma, @prisma/client, lighthouse, chrome-launcher, resend, @lemonsqueezy/lemonsqueezy.js, zod, lucide-react
 
 REQUIREMENTS:
 - Next.js 15 with App Router (app/ directory)

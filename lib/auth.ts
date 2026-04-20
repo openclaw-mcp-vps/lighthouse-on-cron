@@ -1,11 +1,10 @@
-import { type NextRequest } from "next/server";
-import { ACCESS_COOKIE_NAME, getUserByAccessToken } from "@/lib/db";
+import { NextRequest } from "next/server";
+import { ACCESS_COOKIE_NAME, verifyAccessToken } from "@/lib/access";
 
-export async function requireSubscribedUser(request: NextRequest) {
+export function getAccessFromRequest(request: NextRequest) {
   const token = request.cookies.get(ACCESS_COOKIE_NAME)?.value;
   if (!token) {
     return null;
   }
-
-  return getUserByAccessToken(token);
+  return verifyAccessToken(token);
 }

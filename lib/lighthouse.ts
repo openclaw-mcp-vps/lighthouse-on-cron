@@ -1,68 +1,49 @@
-export type CategoryScores = {
-  performance: number;
-  accessibility: number;
-  seo: number;
-  bestPractices: number;
-};
+import { z } from "zod";
 
-export type LighthouseAudit = {
-  requestedUrl: string;
-  finalUrl: string;
-  fetchTime: string;
-  scores: CategoryScores;
-  report: unknown;
-};
+const scoreSchema = z.object({
+  performance: z.number().min(0).max(100),
+  accessibility: z.number().min(0).max(100),
+  seo: z.number().min(0).max(100),
+  bestPractices: z.number().min(0).max(100)
+});
 
-function toPercent(rawScore: number | null | undefined) {
-  if (rawScore === null || rawScore === undefined) {
-    return 0;
-  }
-  return Math.round(rawScore * 100);
-}
+export type LighthouseScoreSet = z.infer<typeof scoreSchema>;
 
-export async function runLighthouseAudit(targetUrl: string): Promise<LighthouseAudit> {
-  const normalizedUrl = /^https?:\/\//i.test(targetUrl) ? targetUrl : `https://${targetUrl}`;
+export async function runLighthouseAudit(url: string): Promise<{ scores: LighthouseScoreSet; report: unknown }> {
+  const [{ default: lighthouse }, { launch }] = await Promise.all([import("lighthouse"), import("chrome-launcher")]);
 
-  const chromeLauncher = await import("chrome-launcher");
-  const lighthouseModule = await import("lighthouse");
-  const lighthouse = lighthouseModule.default;
-
-  const chrome = await chromeLauncher.launch({
+  const chrome = await launch({
     chromeFlags: ["--headless=new", "--disable-gpu", "--no-sandbox", "--disable-dev-shm-usage"]
   });
 
   try {
-    const runnerResult = await lighthouse(
-      normalizedUrl,
+    const result = await lighthouse(
+      url,
       {
         port: chrome.port,
         output: "json",
+        onlyCategories: ["performance", "accessibility", "seo", "best-practices"],
         logLevel: "error",
-        onlyCategories: ["performance", "accessibility", "best-practices", "seo"]
+        formFactor: "mobile"
       },
-      {
-        extends: "lighthouse:default"
-      }
+      undefined
     );
 
-    const lhr = runnerResult?.lhr;
-    if (!lhr) {
-      throw new Error(`Lighthouse failed for ${normalizedUrl}.`);
+    if (!result?.lhr?.categories) {
+      throw new Error(`Lighthouse did not return categories for URL: ${url}`);
     }
 
-    const scores: CategoryScores = {
-      performance: toPercent(lhr.categories.performance?.score),
-      accessibility: toPercent(lhr.categories.accessibility?.score),
-      seo: toPercent(lhr.categories.seo?.score),
-      bestPractices: toPercent(lhr.categories["best-practices"]?.score)
+    const categories = result.lhr.categories;
+    const scorePayload = {
+      performance: Math.round((categories.performance?.score ?? 0) * 100),
+      accessibility: Math.round((categories.accessibility?.score ?? 0) * 100),
+      seo: Math.round((categories.seo?.score ?? 0) * 100),
+      bestPractices: Math.round((categories["best-practices"]?.score ?? 0) * 100)
     };
 
     return {
-      requestedUrl: normalizedUrl,
-      finalUrl: lhr.finalUrl ?? normalizedUrl,
-      fetchTime: lhr.fetchTime ?? new Date().toISOString(),
-      scores,
-      report: lhr
+      scores: scoreSchema.parse(scorePayload),
+      report: result.lhr
     };
   } finally {
     await chrome.kill();
