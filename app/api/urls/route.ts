@@ -1,69 +1,114 @@
 import { NextRequest, NextResponse } from "next/server";
 import { z } from "zod";
-import { getAccessFromRequest } from "@/lib/auth";
-import { addTrackedUrlByEmail, getUrlLimitForEmail, listTrackedUrlsByEmail, removeTrackedUrlByEmail } from "@/lib/db";
+
+import { ACCESS_COOKIE_NAME, verifyAccessToken } from "@/lib/auth";
+import {
+  addMonitoredUrl,
+  getSubscriber,
+  isSubscriberActive,
+  listMonitoredUrls,
+  removeMonitoredUrl
+} from "@/lib/db";
 
 const addSchema = z.object({
   url: z.string().min(4)
 });
 
-const removeSchema = z.object({
+const deleteSchema = z.object({
   id: z.number().int().positive()
 });
 
+function getAuthorizedEmail(request: NextRequest) {
+  const token = request.cookies.get(ACCESS_COOKIE_NAME)?.value;
+  const session = verifyAccessToken(token);
+  if (!session) {
+    return null;
+  }
+  return session.email;
+}
+
+function resolveLimit(plan: string | undefined) {
+  if (plan === "agency") {
+    return null;
+  }
+  return 10;
+}
+
 export async function GET(request: NextRequest) {
-  const access = getAccessFromRequest(request);
-  if (!access) {
+  const email = getAuthorizedEmail(request);
+  if (!email) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
-  try {
-    const [items, limit] = await Promise.all([
-      listTrackedUrlsByEmail(access.email),
-      getUrlLimitForEmail(access.email)
-    ]);
-
-    return NextResponse.json({ items, limit });
-  } catch {
-    return NextResponse.json({ error: "Failed to read URLs" }, { status: 500 });
+  const subscriber = getSubscriber(email);
+  if (!subscriber || !isSubscriberActive(subscriber.status)) {
+    return NextResponse.json({ error: "Subscription required" }, { status: 403 });
   }
+
+  const urls = listMonitoredUrls(email);
+  return NextResponse.json({
+    urls,
+    count: urls.length,
+    limit: resolveLimit(subscriber.plan)
+  });
 }
 
 export async function POST(request: NextRequest) {
-  const access = getAccessFromRequest(request);
-  if (!access) {
+  const email = getAuthorizedEmail(request);
+  if (!email) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
-  const parsed = addSchema.safeParse(await request.json().catch(() => null));
-  if (!parsed.success) {
-    return NextResponse.json({ error: "URL is required" }, { status: 400 });
-  }
-
   try {
-    const item = await addTrackedUrlByEmail(access.email, parsed.data.url);
-    return NextResponse.json({ item });
+    const payload = addSchema.parse(await request.json());
+    const urls = addMonitoredUrl(email, payload.url);
+    const subscriber = getSubscriber(email);
+
+    return NextResponse.json({
+      urls,
+      count: urls.length,
+      limit: resolveLimit(subscriber?.plan)
+    });
   } catch (error) {
-    const message = error instanceof Error ? error.message : "Failed to add URL";
-    return NextResponse.json({ error: message }, { status: 400 });
+    if (error instanceof z.ZodError) {
+      return NextResponse.json({ error: "A valid URL is required." }, { status: 400 });
+    }
+
+    return NextResponse.json(
+      {
+        error: error instanceof Error ? error.message : "Could not add URL"
+      },
+      { status: 400 }
+    );
   }
 }
 
 export async function DELETE(request: NextRequest) {
-  const access = getAccessFromRequest(request);
-  if (!access) {
+  const email = getAuthorizedEmail(request);
+  if (!email) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
-  const parsed = removeSchema.safeParse(await request.json().catch(() => null));
-  if (!parsed.success) {
-    return NextResponse.json({ error: "URL id is required" }, { status: 400 });
-  }
-
   try {
-    const ok = await removeTrackedUrlByEmail(access.email, parsed.data.id);
-    return NextResponse.json({ ok });
-  } catch {
-    return NextResponse.json({ error: "Failed to remove URL" }, { status: 500 });
+    const payload = deleteSchema.parse(await request.json());
+    const urls = removeMonitoredUrl(email, payload.id);
+    const subscriber = getSubscriber(email);
+
+    return NextResponse.json({
+      urls,
+      count: urls.length,
+      limit: resolveLimit(subscriber?.plan)
+    });
+  } catch (error) {
+    if (error instanceof z.ZodError) {
+      return NextResponse.json({ error: "A valid URL id is required." }, { status: 400 });
+    }
+
+    return NextResponse.json(
+      {
+        error: error instanceof Error ? error.message : "Could not delete URL"
+      },
+      { status: 400 }
+    );
   }
 }

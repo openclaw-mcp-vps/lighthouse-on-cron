@@ -1,8 +1,8 @@
 import type { NextConfig } from "next";
 
 const nextConfig: NextConfig = {
-  reactStrictMode: true,
-  serverExternalPackages: ["lighthouse", "chrome-launcher"]
+  typedRoutes: true,
+  serverExternalPackages: ["better-sqlite3"]
 };
 
 export default nextConfig;

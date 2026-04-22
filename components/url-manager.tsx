@@ -1,139 +1,184 @@
 "use client";
 
-import { useMemo, useState } from "react";
-import { Globe2, Plus, Trash2 } from "lucide-react";
-import { Button } from "@/components/ui/button";
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
-import { Input } from "@/components/ui/input";
+import { useEffect, useState } from "react";
 
-export type UrlItem = {
+import { Button } from "@/components/ui/button";
+import {
+  Card,
+  CardContent,
+  CardDescription,
+  CardHeader,
+  CardTitle
+} from "@/components/ui/card";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+
+interface UrlEntry {
   id: number;
   url: string;
   createdAt: string;
-};
+}
 
-type UrlManagerProps = {
-  initialUrls: UrlItem[];
-  urlLimit: number;
-};
+interface UrlResponse {
+  urls: UrlEntry[];
+  limit: number | null;
+  count: number;
+}
 
-export function UrlManager({ initialUrls, urlLimit }: UrlManagerProps) {
-  const [urls, setUrls] = useState(initialUrls);
+export function UrlManager() {
+  const [urls, setUrls] = useState<UrlEntry[]>([]);
+  const [limit, setLimit] = useState<number | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [pending, setPending] = useState(false);
   const [urlInput, setUrlInput] = useState("");
-  const [busy, setBusy] = useState(false);
+  const [message, setMessage] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
-  const limitLabel = useMemo(() => {
-    if (!Number.isFinite(urlLimit)) {
-      return "Unlimited";
-    }
-    return `${urls.length}/${urlLimit}`;
-  }, [urlLimit, urls.length]);
+  async function loadUrls() {
+    setLoading(true);
+    setError(null);
 
-  const addUrl = async () => {
+    try {
+      const response = await fetch("/api/urls", { cache: "no-store" });
+      const data = (await response.json()) as UrlResponse | { error: string };
+
+      if (!response.ok || "error" in data) {
+        throw new Error("error" in data ? data.error : "Failed to fetch URLs");
+      }
+
+      setUrls(data.urls);
+      setLimit(data.limit);
+    } catch (loadError) {
+      setError(loadError instanceof Error ? loadError.message : "Failed to load URLs.");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    void loadUrls();
+  }, []);
+
+  async function addUrl() {
     if (!urlInput.trim()) {
+      setError("Please enter a URL.");
       return;
     }
 
-    setBusy(true);
+    setPending(true);
     setError(null);
+    setMessage(null);
 
     try {
       const response = await fetch("/api/urls", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { "content-type": "application/json" },
         body: JSON.stringify({ url: urlInput })
       });
 
-      const payload = (await response.json()) as { error?: string; item?: UrlItem };
-      if (!response.ok || !payload.item) {
-        setError(payload.error ?? "Could not add URL.");
-        return;
+      const data = (await response.json()) as UrlResponse | { error: string };
+      if (!response.ok || "error" in data) {
+        throw new Error("error" in data ? data.error : "Could not add URL.");
       }
 
-      setUrls((current) => [payload.item as UrlItem, ...current]);
+      setUrls(data.urls);
+      setLimit(data.limit);
       setUrlInput("");
-    } catch {
-      setError("Network error while adding URL.");
+      setMessage("URL added. It will be included in the next Sunday audit run.");
+    } catch (addError) {
+      setError(addError instanceof Error ? addError.message : "Could not add URL.");
     } finally {
-      setBusy(false);
+      setPending(false);
     }
-  };
+  }
 
-  const removeUrl = async (id: number) => {
-    setBusy(true);
+  async function removeUrl(id: number) {
+    setPending(true);
     setError(null);
+    setMessage(null);
 
     try {
       const response = await fetch("/api/urls", {
         method: "DELETE",
-        headers: { "Content-Type": "application/json" },
+        headers: { "content-type": "application/json" },
         body: JSON.stringify({ id })
       });
 
-      const payload = (await response.json()) as { error?: string; ok?: boolean };
-      if (!response.ok) {
-        setError(payload.error ?? "Could not remove URL.");
-        return;
+      const data = (await response.json()) as UrlResponse | { error: string };
+      if (!response.ok || "error" in data) {
+        throw new Error("error" in data ? data.error : "Could not remove URL.");
       }
 
-      setUrls((current) => current.filter((item) => item.id !== id));
-    } catch {
-      setError("Network error while removing URL.");
+      setUrls(data.urls);
+      setLimit(data.limit);
+      setMessage("URL removed.");
+    } catch (removeError) {
+      setError(removeError instanceof Error ? removeError.message : "Could not remove URL.");
     } finally {
-      setBusy(false);
+      setPending(false);
     }
-  };
+  }
 
   return (
     <Card>
       <CardHeader>
-        <CardTitle className="flex items-center justify-between gap-3">
-          <span className="inline-flex items-center gap-2">
-            <Globe2 size={18} />
-            Tracked URLs
-          </span>
-          <span className="rounded-lg border border-[#2f3947] px-2 py-1 text-xs text-muted">{limitLabel}</span>
-        </CardTitle>
+        <CardTitle>Monitored URLs</CardTitle>
         <CardDescription>
-          Add pages you care about. Each Sunday we audit these exact URLs and compare against last week.
+          Add canonical URLs that matter for ranking and revenue. Lighthouse audits run weekly on Sunday.
         </CardDescription>
       </CardHeader>
-      <CardContent className="space-y-4">
-        <div className="grid gap-3 md:grid-cols-[1fr_auto]">
-          <Input
-            type="url"
-            placeholder="https://example.com/pricing"
-            value={urlInput}
-            onChange={(event) => setUrlInput(event.target.value)}
-          />
-          <Button onClick={addUrl} disabled={busy}>
-            <Plus size={16} className="mr-1" />
-            Add URL
-          </Button>
+      <CardContent>
+        <div className="mb-4 space-y-3">
+          <Label htmlFor="url-input">URL</Label>
+          <div className="flex flex-col gap-3 sm:flex-row">
+            <Input
+              id="url-input"
+              placeholder="https://example.com/pricing"
+              value={urlInput}
+              onChange={(event) => setUrlInput(event.target.value)}
+            />
+            <Button type="button" onClick={addUrl} disabled={pending}>
+              Add URL
+            </Button>
+          </div>
+
+          <p className="text-xs text-zinc-400">
+            {limit === null
+              ? `${urls.length} URLs tracked (unlimited plan).`
+              : `${urls.length}/${limit} URLs used on your current plan.`}
+          </p>
+          {message ? <p className="text-sm text-emerald-400">{message}</p> : null}
+          {error ? <p className="text-sm text-red-400">{error}</p> : null}
         </div>
 
-        {error ? <p className="text-sm text-[#f85149]">{error}</p> : null}
-
-        <div className="space-y-2">
-          {urls.length === 0 ? (
-            <p className="text-sm text-muted">No URLs tracked yet. Add your homepage or money pages first.</p>
-          ) : (
-            urls.map((item) => (
-              <div
-                key={item.id}
-                className="flex items-center justify-between rounded-xl border border-[#2f3947] bg-[#0f141b] px-3 py-2"
+        {loading ? (
+          <p className="text-sm text-zinc-400">Loading tracked URLs…</p>
+        ) : urls.length === 0 ? (
+          <p className="text-sm text-zinc-400">No URLs added yet. Add one to start weekly audits.</p>
+        ) : (
+          <ul className="space-y-2">
+            {urls.map((entry) => (
+              <li
+                key={entry.id}
+                className="flex flex-col gap-2 rounded-md border border-zinc-800 bg-zinc-950/70 px-3 py-3 sm:flex-row sm:items-center sm:justify-between"
               >
-                <a href={item.url} target="_blank" rel="noreferrer" className="truncate text-sm text-[#58a6ff] hover:underline">
-                  {item.url}
-                </a>
-                <Button variant="ghost" size="sm" onClick={() => removeUrl(item.id)} disabled={busy}>
-                  <Trash2 size={15} />
+                <div>
+                  <p className="break-all text-sm font-medium text-zinc-200">{entry.url}</p>
+                  <p className="text-xs text-zinc-500">Added {new Date(entry.createdAt).toLocaleString()}</p>
+                </div>
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  disabled={pending}
+                  onClick={() => removeUrl(entry.id)}
+                >
+                  Remove
                 </Button>
-              </div>
-            ))
-          )}
-        </div>
+              </li>
+            ))}
+          </ul>
+        )}
       </CardContent>
     </Card>
   );

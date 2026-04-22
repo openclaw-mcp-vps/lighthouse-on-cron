@@ -1,486 +1,439 @@
-import { Pool } from "pg";
+import "server-only";
 
-type PlanName = "starter" | "unlimited";
+import { createHash } from "node:crypto";
+import { mkdirSync } from "node:fs";
+import { dirname } from "node:path";
 
-type SubscriptionStatus = "active" | "on_trial" | "paused" | "cancelled" | "expired" | "past_due";
+import Database from "better-sqlite3";
 
-let pool: Pool | null = null;
-let schemaPromise: Promise<void> | null = null;
+export type PlanType = "starter" | "agency";
+export type SubscriberStatus = "active" | "trialing" | "canceled" | "inactive";
 
-function isProd() {
-  return process.env.NODE_ENV === "production";
-}
-
-function getPool() {
-  const connectionString = process.env.DATABASE_URL;
-  if (!connectionString) {
-    throw new Error("DATABASE_URL is required for persistence.");
-  }
-
-  if (!pool) {
-    pool = new Pool({
-      connectionString,
-      ssl: isProd() ? { rejectUnauthorized: false } : undefined
-    });
-  }
-
-  return pool;
-}
-
-async function ensureSchema() {
-  if (!schemaPromise) {
-    schemaPromise = (async () => {
-      const db = getPool();
-
-      await db.query(`
-        CREATE TABLE IF NOT EXISTS users (
-          id BIGSERIAL PRIMARY KEY,
-          email TEXT NOT NULL UNIQUE,
-          plan TEXT NOT NULL DEFAULT 'starter',
-          created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-          updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-        );
-      `);
-
-      await db.query(`
-        CREATE TABLE IF NOT EXISTS subscriptions (
-          id BIGSERIAL PRIMARY KEY,
-          lemon_subscription_id TEXT NOT NULL UNIQUE,
-          user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-          status TEXT NOT NULL,
-          plan TEXT NOT NULL,
-          current_period_end TIMESTAMPTZ NULL,
-          updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-        );
-      `);
-
-      await db.query(`
-        CREATE TABLE IF NOT EXISTS tracked_urls (
-          id BIGSERIAL PRIMARY KEY,
-          user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-          url TEXT NOT NULL,
-          normalized_url TEXT NOT NULL,
-          active BOOLEAN NOT NULL DEFAULT TRUE,
-          created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-          UNIQUE(user_id, normalized_url)
-        );
-      `);
-
-      await db.query(`
-        CREATE TABLE IF NOT EXISTS audit_runs (
-          id BIGSERIAL PRIMARY KEY,
-          tracked_url_id BIGINT NOT NULL REFERENCES tracked_urls(id) ON DELETE CASCADE,
-          run_week DATE NOT NULL,
-          performance INTEGER NOT NULL,
-          accessibility INTEGER NOT NULL,
-          seo INTEGER NOT NULL,
-          best_practices INTEGER NOT NULL,
-          raw_json JSONB NULL,
-          created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-          UNIQUE(tracked_url_id, run_week)
-        );
-      `);
-
-      await db.query(`
-        CREATE TABLE IF NOT EXISTS app_state (
-          key TEXT PRIMARY KEY,
-          value TEXT NOT NULL,
-          updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-        );
-      `);
-
-      await db.query("CREATE INDEX IF NOT EXISTS idx_urls_user_active ON tracked_urls(user_id, active);");
-      await db.query("CREATE INDEX IF NOT EXISTS idx_audit_runs_url_week ON audit_runs(tracked_url_id, run_week DESC);");
-      await db.query("CREATE INDEX IF NOT EXISTS idx_subscriptions_user_status ON subscriptions(user_id, status);");
-    })();
-  }
-
-  return schemaPromise;
-}
-
-export function normalizeUrl(raw: string) {
-  const withProtocol = raw.startsWith("http://") || raw.startsWith("https://") ? raw : `https://${raw}`;
-  const parsed = new URL(withProtocol.trim());
-  parsed.hash = "";
-  if (parsed.pathname.endsWith("/")) {
-    parsed.pathname = parsed.pathname.slice(0, -1) || "/";
-  }
-  return parsed.toString();
-}
-
-function mapPlan(input: string | null | undefined): PlanName {
-  const value = (input ?? "").toLowerCase();
-  if (value.includes("unlimited") || value.includes("agency") || value.includes("29")) {
-    return "unlimited";
-  }
-  return "starter";
-}
-
-function isActiveSubscription(status: string) {
-  return status === "active" || status === "on_trial";
-}
-
-async function getOrCreateUser(email: string, plan: PlanName = "starter") {
-  await ensureSchema();
-  const db = getPool();
-  const normalizedEmail = email.trim().toLowerCase();
-
-  const result = await db.query<{ id: string; email: string; plan: PlanName }>(
-    `
-      INSERT INTO users(email, plan, updated_at)
-      VALUES($1, $2, NOW())
-      ON CONFLICT(email) DO UPDATE SET
-        plan = EXCLUDED.plan,
-        updated_at = NOW()
-      RETURNING id, email, plan;
-    `,
-    [normalizedEmail, plan]
-  );
-
-  return {
-    id: Number(result.rows[0].id),
-    email: result.rows[0].email,
-    plan: result.rows[0].plan
-  };
-}
-
-export async function upsertSubscriptionFromWebhook(input: {
+export interface Subscriber {
   email: string;
-  lemonSubscriptionId: string;
-  status: SubscriptionStatus;
-  planLabel?: string | null;
-  currentPeriodEnd?: string | null;
-}) {
-  await ensureSchema();
-  const db = getPool();
-  const plan = mapPlan(input.planLabel);
-  const user = await getOrCreateUser(input.email, plan);
-
-  await db.query(
-    `
-      INSERT INTO subscriptions(lemon_subscription_id, user_id, status, plan, current_period_end, updated_at)
-      VALUES($1, $2, $3, $4, $5, NOW())
-      ON CONFLICT(lemon_subscription_id)
-      DO UPDATE SET
-        status = EXCLUDED.status,
-        plan = EXCLUDED.plan,
-        current_period_end = EXCLUDED.current_period_end,
-        updated_at = NOW();
-    `,
-    [input.lemonSubscriptionId, user.id, input.status, plan, input.currentPeriodEnd ?? null]
-  );
-
-  await db.query("UPDATE users SET plan = $1, updated_at = NOW() WHERE id = $2", [plan, user.id]);
+  status: SubscriberStatus;
+  plan: PlanType;
+  stripeCustomerId: string | null;
+  stripeSubscriptionId: string | null;
+  createdAt: string;
+  updatedAt: string;
 }
 
-export async function findActiveSubscriptionByEmail(email: string) {
-  await ensureSchema();
-  const db = getPool();
-  const result = await db.query<{
-    email: string;
-    plan: PlanName;
-    status: string;
-    current_period_end: string | null;
-  }>(
-    `
-      SELECT u.email, s.plan, s.status, s.current_period_end
-      FROM users u
-      JOIN subscriptions s ON s.user_id = u.id
-      WHERE u.email = $1
-      ORDER BY s.updated_at DESC
-      LIMIT 1;
-    `,
-    [email.trim().toLowerCase()]
-  );
-
-  if (result.rowCount === 0) {
-    return null;
-  }
-
-  const row = result.rows[0];
-  return {
-    email: row.email,
-    plan: row.plan,
-    status: row.status,
-    currentPeriodEnd: row.current_period_end,
-    active: isActiveSubscription(row.status)
-  };
+export interface MonitoredUrl {
+  id: number;
+  email: string;
+  url: string;
+  createdAt: string;
 }
 
-export async function getUrlLimitForEmail(email: string) {
-  const subscription = await findActiveSubscriptionByEmail(email);
-  if (!subscription || !subscription.active) {
-    return 0;
-  }
-  return subscription.plan === "unlimited" ? Number.POSITIVE_INFINITY : 10;
-}
-
-export async function listTrackedUrlsByEmail(email: string) {
-  await ensureSchema();
-  const db = getPool();
-  const rows = await db.query<{ id: string; url: string; created_at: string }>(
-    `
-      SELECT t.id, t.url, t.created_at
-      FROM tracked_urls t
-      JOIN users u ON u.id = t.user_id
-      WHERE u.email = $1 AND t.active = TRUE
-      ORDER BY t.created_at DESC;
-    `,
-    [email.trim().toLowerCase()]
-  );
-
-  return rows.rows.map((row) => ({
-    id: Number(row.id),
-    url: row.url,
-    createdAt: row.created_at
-  }));
-}
-
-export async function addTrackedUrlByEmail(email: string, url: string) {
-  await ensureSchema();
-  const db = getPool();
-  const normalized = normalizeUrl(url);
-  const sub = await findActiveSubscriptionByEmail(email);
-
-  if (!sub || !sub.active) {
-    throw new Error("Active subscription required to track URLs.");
-  }
-
-  const maxUrls = sub.plan === "unlimited" ? Number.POSITIVE_INFINITY : 10;
-  const user = await getOrCreateUser(email, sub.plan);
-
-  if (Number.isFinite(maxUrls)) {
-    const count = await db.query<{ count: string }>(
-      "SELECT COUNT(*)::text AS count FROM tracked_urls WHERE user_id = $1 AND active = TRUE",
-      [user.id]
-    );
-
-    if (Number(count.rows[0].count) >= maxUrls) {
-      throw new Error("Starter plan reached the 10 URL limit. Upgrade for unlimited URLs.");
-    }
-  }
-
-  const inserted = await db.query<{ id: string; url: string; created_at: string }>(
-    `
-      INSERT INTO tracked_urls(user_id, url, normalized_url, active)
-      VALUES($1, $2, $3, TRUE)
-      ON CONFLICT(user_id, normalized_url)
-      DO UPDATE SET active = TRUE
-      RETURNING id, url, created_at;
-    `,
-    [user.id, normalized, normalized]
-  );
-
-  return {
-    id: Number(inserted.rows[0].id),
-    url: inserted.rows[0].url,
-    createdAt: inserted.rows[0].created_at
-  };
-}
-
-export async function removeTrackedUrlByEmail(email: string, urlId: number) {
-  await ensureSchema();
-  const db = getPool();
-  const user = await db.query<{ id: string }>("SELECT id FROM users WHERE email = $1", [email.trim().toLowerCase()]);
-
-  if (!user.rowCount) {
-    return false;
-  }
-
-  const result = await db.query("UPDATE tracked_urls SET active = FALSE WHERE id = $1 AND user_id = $2", [
-    urlId,
-    Number(user.rows[0].id)
-  ]);
-
-  return result.rowCount > 0;
-}
-
-export type WeeklyAuditInsert = {
-  trackedUrlId: number;
+export interface AuditSnapshot {
+  id: number;
+  monitoredUrlId: number;
   runWeek: string;
   performance: number;
   accessibility: number;
   seo: number;
   bestPractices: number;
-  rawJson?: unknown;
-};
-
-export async function upsertAuditRun(payload: WeeklyAuditInsert) {
-  await ensureSchema();
-  const db = getPool();
-
-  await db.query(
-    `
-      INSERT INTO audit_runs(tracked_url_id, run_week, performance, accessibility, seo, best_practices, raw_json)
-      VALUES($1, $2, $3, $4, $5, $6, $7)
-      ON CONFLICT(tracked_url_id, run_week)
-      DO UPDATE SET
-        performance = EXCLUDED.performance,
-        accessibility = EXCLUDED.accessibility,
-        seo = EXCLUDED.seo,
-        best_practices = EXCLUDED.best_practices,
-        raw_json = EXCLUDED.raw_json;
-    `,
-    [
-      payload.trackedUrlId,
-      payload.runWeek,
-      payload.performance,
-      payload.accessibility,
-      payload.seo,
-      payload.bestPractices,
-      payload.rawJson ? JSON.stringify(payload.rawJson) : null
-    ]
-  );
+  lcp: number | null;
+  cls: number | null;
+  tbt: number | null;
+  fcp: number | null;
+  speedIndex: number | null;
+  createdAt: string;
 }
 
-export async function getLatestTwoAuditRunsForUrl(trackedUrlId: number) {
-  await ensureSchema();
-  const db = getPool();
-  const rows = await db.query<{
-    run_week: string;
-    performance: number;
-    accessibility: number;
-    seo: number;
-    best_practices: number;
-    created_at: string;
-  }>(
-    `
-      SELECT run_week, performance, accessibility, seo, best_practices, created_at
-      FROM audit_runs
-      WHERE tracked_url_id = $1
-      ORDER BY run_week DESC
-      LIMIT 2;
-    `,
-    [trackedUrlId]
-  );
+export interface ReportRow {
+  urlId: number;
+  url: string;
+  current: AuditSnapshot | null;
+  previous: AuditSnapshot | null;
+}
 
-  return rows.rows.map((row) => ({
-    runWeek: row.run_week,
+interface AuditInput {
+  monitoredUrlId: number;
+  runWeek: string;
+  performance: number;
+  accessibility: number;
+  seo: number;
+  bestPractices: number;
+  lcp?: number | null;
+  cls?: number | null;
+  tbt?: number | null;
+  fcp?: number | null;
+  speedIndex?: number | null;
+  rawJson?: string | null;
+}
+
+const DEFAULT_DB_PATH = process.env.DATABASE_PATH ?? "./data/lighthouse.db";
+
+declare global {
+  // eslint-disable-next-line no-var
+  var __lighthouseCronDb: Database.Database | undefined;
+}
+
+function nowIso() {
+  return new Date().toISOString();
+}
+
+function normalizeEmail(email: string) {
+  return email.trim().toLowerCase();
+}
+
+function normalizeUrl(input: string) {
+  const trimmed = input.trim();
+  const withProtocol = /^https?:\/\//i.test(trimmed) ? trimmed : `https://${trimmed}`;
+  const parsed = new URL(withProtocol);
+
+  if (!["http:", "https:"].includes(parsed.protocol)) {
+    throw new Error("Only http and https URLs are supported.");
+  }
+
+  parsed.hash = "";
+
+  const serialized = parsed.toString();
+  return serialized.endsWith("/") ? serialized.slice(0, -1) : serialized;
+}
+
+function rowToSubscriber(row: Record<string, unknown>): Subscriber {
+  return {
+    email: String(row.email),
+    status: row.status as SubscriberStatus,
+    plan: row.plan as PlanType,
+    stripeCustomerId: (row.stripe_customer_id as string | null) ?? null,
+    stripeSubscriptionId: (row.stripe_subscription_id as string | null) ?? null,
+    createdAt: String(row.created_at),
+    updatedAt: String(row.updated_at)
+  };
+}
+
+function rowToAudit(row: Record<string, unknown>): AuditSnapshot {
+  return {
+    id: Number(row.id),
+    monitoredUrlId: Number(row.monitored_url_id),
+    runWeek: String(row.run_week),
     performance: Number(row.performance),
     accessibility: Number(row.accessibility),
     seo: Number(row.seo),
     bestPractices: Number(row.best_practices),
-    createdAt: row.created_at
-  }));
-}
-
-export async function getDashboardReportByEmail(email: string) {
-  const urls = await listTrackedUrlsByEmail(email);
-  const reportRows = await Promise.all(
-    urls.map(async (urlRow) => {
-      const runs = await getLatestTwoAuditRunsForUrl(urlRow.id);
-      const current = runs[0] ?? null;
-      const previous = runs[1] ?? null;
-
-      return {
-        trackedUrlId: urlRow.id,
-        url: urlRow.url,
-        current,
-        previous
-      };
-    })
-  );
-
-  return reportRows;
-}
-
-export async function getWeeklyCronTargets() {
-  await ensureSchema();
-  const db = getPool();
-  const rows = await db.query<{
-    user_id: string;
-    email: string;
-    plan: PlanName;
-    tracked_url_id: string;
-    url: string;
-  }>(
-    `
-      SELECT u.id AS user_id, u.email, s.plan, t.id AS tracked_url_id, t.url
-      FROM users u
-      JOIN subscriptions s ON s.user_id = u.id
-      JOIN tracked_urls t ON t.user_id = u.id
-      WHERE t.active = TRUE
-      AND s.status IN ('active', 'on_trial')
-      ORDER BY u.email ASC, t.created_at ASC;
-    `
-  );
-
-  const users = new Map<
-    string,
-    { userId: number; email: string; plan: PlanName; urls: Array<{ trackedUrlId: number; url: string }> }
-  >();
-
-  for (const row of rows.rows) {
-    const key = row.email;
-    if (!users.has(key)) {
-      users.set(key, {
-        userId: Number(row.user_id),
-        email: row.email,
-        plan: row.plan,
-        urls: []
-      });
-    }
-
-    users.get(key)?.urls.push({
-      trackedUrlId: Number(row.tracked_url_id),
-      url: row.url
-    });
-  }
-
-  return [...users.values()];
-}
-
-export async function getPreviousAuditBeforeWeek(trackedUrlId: number, week: string) {
-  await ensureSchema();
-  const db = getPool();
-  const row = await db.query<{
-    run_week: string;
-    performance: number;
-    accessibility: number;
-    seo: number;
-    best_practices: number;
-  }>(
-    `
-      SELECT run_week, performance, accessibility, seo, best_practices
-      FROM audit_runs
-      WHERE tracked_url_id = $1 AND run_week < $2
-      ORDER BY run_week DESC
-      LIMIT 1;
-    `,
-    [trackedUrlId, week]
-  );
-
-  if (!row.rowCount) {
-    return null;
-  }
-
-  const item = row.rows[0];
-  return {
-    runWeek: item.run_week,
-    performance: Number(item.performance),
-    accessibility: Number(item.accessibility),
-    seo: Number(item.seo),
-    bestPractices: Number(item.best_practices)
+    lcp: row.lcp === null ? null : Number(row.lcp),
+    cls: row.cls === null ? null : Number(row.cls),
+    tbt: row.tbt === null ? null : Number(row.tbt),
+    fcp: row.fcp === null ? null : Number(row.fcp),
+    speedIndex: row.speed_index === null ? null : Number(row.speed_index),
+    createdAt: String(row.created_at)
   };
 }
 
-export async function getLastCronWeek() {
-  await ensureSchema();
-  const db = getPool();
-  const result = await db.query<{ value: string }>("SELECT value FROM app_state WHERE key = 'last_cron_week'");
-  return result.rowCount ? result.rows[0].value : null;
+function initSchema(db: Database.Database) {
+  db.exec(`
+    PRAGMA journal_mode = WAL;
+
+    CREATE TABLE IF NOT EXISTS subscribers (
+      email TEXT PRIMARY KEY,
+      status TEXT NOT NULL,
+      plan TEXT NOT NULL,
+      stripe_customer_id TEXT,
+      stripe_subscription_id TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS monitored_urls (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      email TEXT NOT NULL,
+      url TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      UNIQUE(email, url),
+      FOREIGN KEY(email) REFERENCES subscribers(email)
+    );
+
+    CREATE TABLE IF NOT EXISTS audits (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      monitored_url_id INTEGER NOT NULL,
+      run_week TEXT NOT NULL,
+      performance REAL NOT NULL,
+      accessibility REAL NOT NULL,
+      seo REAL NOT NULL,
+      best_practices REAL NOT NULL,
+      lcp REAL,
+      cls REAL,
+      tbt REAL,
+      fcp REAL,
+      speed_index REAL,
+      raw_json TEXT,
+      created_at TEXT NOT NULL,
+      FOREIGN KEY(monitored_url_id) REFERENCES monitored_urls(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS login_codes (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      email TEXT NOT NULL,
+      code_hash TEXT NOT NULL,
+      expires_at TEXT NOT NULL,
+      used_at TEXT,
+      created_at TEXT NOT NULL
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_monitored_urls_email ON monitored_urls(email);
+    CREATE INDEX IF NOT EXISTS idx_audits_monitored_url_id ON audits(monitored_url_id);
+    CREATE INDEX IF NOT EXISTS idx_login_codes_email ON login_codes(email);
+  `);
 }
 
-export async function setLastCronWeek(week: string) {
-  await ensureSchema();
-  const db = getPool();
-  await db.query(
+export function getDb() {
+  if (global.__lighthouseCronDb) {
+    return global.__lighthouseCronDb;
+  }
+
+  mkdirSync(dirname(DEFAULT_DB_PATH), { recursive: true });
+  const db = new Database(DEFAULT_DB_PATH);
+  initSchema(db);
+  global.__lighthouseCronDb = db;
+  return db;
+}
+
+export function getSubscriber(email: string): Subscriber | null {
+  const db = getDb();
+  const row = db
+    .prepare("SELECT * FROM subscribers WHERE email = ?")
+    .get(normalizeEmail(email)) as Record<string, unknown> | undefined;
+
+  return row ? rowToSubscriber(row) : null;
+}
+
+export function getSubscriberByStripeCustomerId(customerId: string) {
+  const db = getDb();
+  const row = db
+    .prepare("SELECT * FROM subscribers WHERE stripe_customer_id = ?")
+    .get(customerId) as Record<string, unknown> | undefined;
+
+  return row ? rowToSubscriber(row) : null;
+}
+
+export function upsertSubscriber(input: {
+  email: string;
+  status?: SubscriberStatus;
+  plan?: PlanType;
+  stripeCustomerId?: string | null;
+  stripeSubscriptionId?: string | null;
+}) {
+  const db = getDb();
+  const email = normalizeEmail(input.email);
+  const now = nowIso();
+
+  db.prepare(
     `
-      INSERT INTO app_state(key, value, updated_at)
-      VALUES('last_cron_week', $1, NOW())
-      ON CONFLICT(key)
-      DO UPDATE SET value = EXCLUDED.value, updated_at = NOW();
-    `,
-    [week]
+      INSERT INTO subscribers (
+        email,
+        status,
+        plan,
+        stripe_customer_id,
+        stripe_subscription_id,
+        created_at,
+        updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(email) DO UPDATE SET
+        status = excluded.status,
+        plan = excluded.plan,
+        stripe_customer_id = COALESCE(excluded.stripe_customer_id, subscribers.stripe_customer_id),
+        stripe_subscription_id = COALESCE(excluded.stripe_subscription_id, subscribers.stripe_subscription_id),
+        updated_at = excluded.updated_at
+    `
+  ).run(
+    email,
+    input.status ?? "active",
+    input.plan ?? "starter",
+    input.stripeCustomerId ?? null,
+    input.stripeSubscriptionId ?? null,
+    now,
+    now
   );
+
+  return getSubscriber(email);
+}
+
+export function updateSubscriberStatusByCustomerId(customerId: string, status: SubscriberStatus) {
+  const db = getDb();
+  db.prepare("UPDATE subscribers SET status = ?, updated_at = ? WHERE stripe_customer_id = ?").run(
+    status,
+    nowIso(),
+    customerId
+  );
+}
+
+export function updateSubscriberStatus(email: string, status: SubscriberStatus) {
+  const db = getDb();
+  db.prepare("UPDATE subscribers SET status = ?, updated_at = ? WHERE email = ?").run(
+    status,
+    nowIso(),
+    normalizeEmail(email)
+  );
+}
+
+export function listActiveSubscribers() {
+  const db = getDb();
+  const rows = db
+    .prepare("SELECT * FROM subscribers WHERE status IN ('active', 'trialing') ORDER BY created_at ASC")
+    .all() as Record<string, unknown>[];
+
+  return rows.map(rowToSubscriber);
+}
+
+export function listMonitoredUrls(email: string): MonitoredUrl[] {
+  const db = getDb();
+  const rows = db
+    .prepare("SELECT * FROM monitored_urls WHERE email = ? ORDER BY created_at ASC")
+    .all(normalizeEmail(email)) as Record<string, unknown>[];
+
+  return rows.map((row) => ({
+    id: Number(row.id),
+    email: String(row.email),
+    url: String(row.url),
+    createdAt: String(row.created_at)
+  }));
+}
+
+export function addMonitoredUrl(email: string, url: string) {
+  const db = getDb();
+  const normalizedEmail = normalizeEmail(email);
+  const normalizedUrl = normalizeUrl(url);
+
+  const subscriber = getSubscriber(normalizedEmail);
+  if (!subscriber || !["active", "trialing"].includes(subscriber.status)) {
+    throw new Error("An active subscription is required before adding URLs.");
+  }
+
+  const countRow = db
+    .prepare("SELECT COUNT(*) as count FROM monitored_urls WHERE email = ?")
+    .get(normalizedEmail) as { count: number };
+  const currentCount = countRow.count;
+
+  if (subscriber.plan === "starter" && currentCount >= 10) {
+    throw new Error("Starter plan includes up to 10 URLs. Upgrade to Agency for unlimited URLs.");
+  }
+
+  db.prepare(
+    "INSERT INTO monitored_urls (email, url, created_at) VALUES (?, ?, ?) ON CONFLICT(email, url) DO NOTHING"
+  ).run(normalizedEmail, normalizedUrl, nowIso());
+
+  return listMonitoredUrls(normalizedEmail);
+}
+
+export function removeMonitoredUrl(email: string, urlId: number) {
+  const db = getDb();
+  db.prepare("DELETE FROM monitored_urls WHERE id = ? AND email = ?").run(urlId, normalizeEmail(email));
+  return listMonitoredUrls(email);
+}
+
+export function getLatestAuditForUrl(monitoredUrlId: number): AuditSnapshot | null {
+  const db = getDb();
+  const row = db
+    .prepare("SELECT * FROM audits WHERE monitored_url_id = ? ORDER BY created_at DESC LIMIT 1")
+    .get(monitoredUrlId) as Record<string, unknown> | undefined;
+
+  return row ? rowToAudit(row) : null;
+}
+
+export function saveAuditSnapshot(input: AuditInput) {
+  const db = getDb();
+  db.prepare(
+    `
+      INSERT INTO audits (
+        monitored_url_id,
+        run_week,
+        performance,
+        accessibility,
+        seo,
+        best_practices,
+        lcp,
+        cls,
+        tbt,
+        fcp,
+        speed_index,
+        raw_json,
+        created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `
+  ).run(
+    input.monitoredUrlId,
+    input.runWeek,
+    input.performance,
+    input.accessibility,
+    input.seo,
+    input.bestPractices,
+    input.lcp ?? null,
+    input.cls ?? null,
+    input.tbt ?? null,
+    input.fcp ?? null,
+    input.speedIndex ?? null,
+    input.rawJson ?? null,
+    nowIso()
+  );
+}
+
+export function getLatestReportRows(email: string): ReportRow[] {
+  const db = getDb();
+  const urls = listMonitoredUrls(email);
+
+  return urls.map((entry) => {
+    const rows = db
+      .prepare("SELECT * FROM audits WHERE monitored_url_id = ? ORDER BY created_at DESC LIMIT 2")
+      .all(entry.id) as Record<string, unknown>[];
+
+    return {
+      urlId: entry.id,
+      url: entry.url,
+      current: rows[0] ? rowToAudit(rows[0]) : null,
+      previous: rows[1] ? rowToAudit(rows[1]) : null
+    };
+  });
+}
+
+export function saveLoginCode(email: string, code: string, minutesToLive = 15) {
+  const db = getDb();
+  const normalizedEmail = normalizeEmail(email);
+  const expiresAt = new Date(Date.now() + minutesToLive * 60_000).toISOString();
+
+  db.prepare("DELETE FROM login_codes WHERE email = ?").run(normalizedEmail);
+  db.prepare(
+    "INSERT INTO login_codes (email, code_hash, expires_at, created_at) VALUES (?, ?, ?, ?)"
+  ).run(normalizedEmail, hashCode(code), expiresAt, nowIso());
+}
+
+export function verifyLoginCode(email: string, code: string) {
+  const db = getDb();
+  const normalizedEmail = normalizeEmail(email);
+  const row = db
+    .prepare(
+      `
+        SELECT *
+        FROM login_codes
+        WHERE email = ?
+          AND used_at IS NULL
+          AND expires_at > ?
+        ORDER BY created_at DESC
+        LIMIT 1
+      `
+    )
+    .get(normalizedEmail, nowIso()) as Record<string, unknown> | undefined;
+
+  if (!row) {
+    return false;
+  }
+
+  const expected = String(row.code_hash);
+  if (expected !== hashCode(code)) {
+    return false;
+  }
+
+  db.prepare("UPDATE login_codes SET used_at = ? WHERE id = ?").run(nowIso(), Number(row.id));
+  return true;
+}
+
+export function hashCode(input: string) {
+  return createHash("sha256").update(input).digest("hex");
+}
+
+export function isSubscriberActive(status: SubscriberStatus | string | null | undefined) {
+  return status === "active" || status === "trialing";
 }

@@ -1,124 +1,132 @@
+import "server-only";
+
 import { Resend } from "resend";
 
-type ScoreCard = {
+interface ScoreEmailRow {
+  url: string;
   performance: number;
   accessibility: number;
   seo: number;
   bestPractices: number;
-};
-
-type UrlReportItem = {
-  url: string;
-  current: ScoreCard;
-  previous?: ScoreCard | null;
-  regressionAlerts: string[];
-};
-
-type WeeklyReportPayload = {
-  email: string;
-  weekLabel: string;
-  reports: UrlReportItem[];
-};
-
-function metricDelta(current: number, previous: number | undefined) {
-  if (previous === undefined) {
-    return "new";
-  }
-  const delta = current - previous;
-  const sign = delta > 0 ? "+" : "";
-  return `${sign}${delta}`;
+  performanceDelta: number | null;
+  accessibilityDelta: number | null;
+  seoDelta: number | null;
+  bestPracticesDelta: number | null;
 }
 
-function renderReportHtml(payload: WeeklyReportPayload) {
-  const rows = payload.reports
-    .map((item) => {
-      const prev = item.previous;
-      const alertBadges =
-        item.regressionAlerts.length > 0
-          ? `<div style="margin-top:8px;color:#f85149;font-size:12px;">${item.regressionAlerts.join(" • ")}</div>`
-          : "<div style=\"margin-top:8px;color:#8b949e;font-size:12px;\">No regressions detected</div>";
-
-      return `
-        <tr>
-          <td style="padding:14px;border-bottom:1px solid #2f3947;vertical-align:top;">
-            <a href="${item.url}" style="color:#58a6ff;text-decoration:none;">${item.url}</a>
-            ${alertBadges}
-          </td>
-          <td style="padding:14px;border-bottom:1px solid #2f3947;text-align:center;">${item.current.performance} (${metricDelta(
-            item.current.performance,
-            prev?.performance
-          )})</td>
-          <td style="padding:14px;border-bottom:1px solid #2f3947;text-align:center;">${item.current.accessibility} (${metricDelta(
-            item.current.accessibility,
-            prev?.accessibility
-          )})</td>
-          <td style="padding:14px;border-bottom:1px solid #2f3947;text-align:center;">${item.current.seo} (${metricDelta(
-            item.current.seo,
-            prev?.seo
-          )})</td>
-          <td style="padding:14px;border-bottom:1px solid #2f3947;text-align:center;">${item.current.bestPractices} (${metricDelta(
-            item.current.bestPractices,
-            prev?.bestPractices
-          )})</td>
-        </tr>
-      `;
-    })
-    .join("");
-
-  return `
-    <div style="background:#0d1117;color:#f0f6fc;padding:24px;font-family:Manrope, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;">
-      <h1 style="margin:0 0 10px;font-size:24px;">Your Lighthouse on Cron report</h1>
-      <p style="margin:0 0 20px;color:#9aa4b2;">Week of ${payload.weekLabel}. Alerts appear when a score drops by 5+ points from the previous run.</p>
-      <table style="width:100%;border-collapse:collapse;border:1px solid #2f3947;border-radius:8px;overflow:hidden;">
-        <thead>
-          <tr style="background:#161b22;">
-            <th style="padding:14px;text-align:left;border-bottom:1px solid #2f3947;">URL</th>
-            <th style="padding:14px;text-align:center;border-bottom:1px solid #2f3947;">Performance</th>
-            <th style="padding:14px;text-align:center;border-bottom:1px solid #2f3947;">Accessibility</th>
-            <th style="padding:14px;text-align:center;border-bottom:1px solid #2f3947;">SEO</th>
-            <th style="padding:14px;text-align:center;border-bottom:1px solid #2f3947;">Best Practices</th>
-          </tr>
-        </thead>
-        <tbody>
-          ${rows}
-        </tbody>
-      </table>
-      <p style="margin-top:18px;color:#8b949e;font-size:12px;">
-        You are receiving this weekly report because your Lighthouse on Cron subscription is active.
-      </p>
-    </div>
-  `;
-}
-
-function renderReportText(payload: WeeklyReportPayload) {
-  const lines = payload.reports.map((item) => {
-    const prev = item.previous;
-    const alerts = item.regressionAlerts.length > 0 ? ` | ALERTS: ${item.regressionAlerts.join(", ")}` : "";
-    return `${item.url}\n  Perf ${item.current.performance} (${metricDelta(item.current.performance, prev?.performance)}) | A11y ${item.current.accessibility} (${metricDelta(item.current.accessibility, prev?.accessibility)}) | SEO ${item.current.seo} (${metricDelta(item.current.seo, prev?.seo)}) | Best ${item.current.bestPractices} (${metricDelta(item.current.bestPractices, prev?.bestPractices)})${alerts}`;
-  });
-
-  return [`Lighthouse on Cron weekly report (${payload.weekLabel})`, "", ...lines].join("\n");
-}
-
-export async function sendWeeklyReportEmail(payload: WeeklyReportPayload) {
-  if (payload.reports.length === 0) {
-    return { skipped: true, reason: "No reports to send." };
+function getResendClient() {
+  const key = process.env.RESEND_API_KEY;
+  if (!key) {
+    return null;
   }
 
-  const apiKey = process.env.RESEND_API_KEY;
-  const from = process.env.RESEND_FROM_EMAIL;
-  if (!apiKey || !from) {
-    return { skipped: true, reason: "Missing RESEND_API_KEY or RESEND_FROM_EMAIL." };
+  return new Resend(key);
+}
+
+function deltaLabel(delta: number | null) {
+  if (delta === null) return "new";
+  if (delta === 0) return "0";
+  const fixed = delta > 0 ? `+${delta.toFixed(1)}` : delta.toFixed(1);
+  return fixed;
+}
+
+function toPercent(value: number) {
+  return `${value.toFixed(1)}%`;
+}
+
+export async function sendAccessCodeEmail(params: { email: string; code: string }) {
+  const resend = getResendClient();
+  const from = process.env.RESEND_FROM_EMAIL ?? "Lighthouse on Cron <noreply@example.com>";
+
+  if (!resend) {
+    if (process.env.NODE_ENV !== "production") {
+      return { delivered: false, devCode: params.code };
+    }
+    throw new Error("RESEND_API_KEY is required to send access codes in production.");
   }
 
-  const resend = new Resend(apiKey);
   await resend.emails.send({
     from,
-    to: payload.email,
-    subject: `Weekly Lighthouse report (${payload.weekLabel})`,
-    html: renderReportHtml(payload),
-    text: renderReportText(payload)
+    to: params.email,
+    subject: "Your Lighthouse on Cron access code",
+    html: `
+      <div style="font-family:Arial,sans-serif;max-width:520px;margin:0 auto;padding:24px;color:#111827;">
+        <h1 style="font-size:20px;margin:0 0 12px;">Access code</h1>
+        <p style="line-height:1.5;margin:0 0 16px;">Use this code to unlock your Lighthouse on Cron dashboard:</p>
+        <p style="font-size:32px;font-weight:700;letter-spacing:6px;margin:0 0 12px;">${params.code}</p>
+        <p style="line-height:1.5;color:#4b5563;margin:0;">This code expires in 15 minutes.</p>
+      </div>
+    `
   });
 
-  return { skipped: false };
+  return { delivered: true };
+}
+
+export async function sendWeeklyReportEmail(params: {
+  email: string;
+  runWeek: string;
+  rows: ScoreEmailRow[];
+  regressions: string[];
+}) {
+  const resend = getResendClient();
+  const from = process.env.RESEND_FROM_EMAIL ?? "Lighthouse on Cron <noreply@example.com>";
+
+  if (!resend) {
+    return { delivered: false };
+  }
+
+  const rowsHtml = params.rows
+    .map(
+      (row) => `
+      <tr>
+        <td style="padding:10px;border-bottom:1px solid #e5e7eb;">${row.url}</td>
+        <td style="padding:10px;border-bottom:1px solid #e5e7eb;">${toPercent(row.performance)} (${deltaLabel(row.performanceDelta)})</td>
+        <td style="padding:10px;border-bottom:1px solid #e5e7eb;">${toPercent(row.accessibility)} (${deltaLabel(row.accessibilityDelta)})</td>
+        <td style="padding:10px;border-bottom:1px solid #e5e7eb;">${toPercent(row.seo)} (${deltaLabel(row.seoDelta)})</td>
+        <td style="padding:10px;border-bottom:1px solid #e5e7eb;">${toPercent(row.bestPractices)} (${deltaLabel(row.bestPracticesDelta)})</td>
+      </tr>
+    `
+    )
+    .join("");
+
+  const regressionsHtml =
+    params.regressions.length === 0
+      ? "<p style=\"margin:0;color:#047857;\">No major regressions this week.</p>"
+      : `<ul style="margin:0;padding-left:20px;">${params.regressions
+          .map((item) => `<li style="margin:6px 0;">${item}</li>`)
+          .join("")}</ul>`;
+
+  await resend.emails.send({
+    from,
+    to: params.email,
+    subject: `Weekly Lighthouse report · ${params.runWeek}`,
+    html: `
+      <div style="font-family:Arial,sans-serif;max-width:760px;margin:0 auto;padding:24px;color:#111827;">
+        <h1 style="font-size:24px;margin:0 0 8px;">Weekly Core Web Vitals report</h1>
+        <p style="margin:0 0 18px;color:#4b5563;">Scores are from the latest Lighthouse mobile run completed for week ${params.runWeek}.</p>
+
+        <table style="width:100%;border-collapse:collapse;font-size:14px;margin-bottom:18px;">
+          <thead>
+            <tr style="background:#f3f4f6;text-align:left;">
+              <th style="padding:10px;">URL</th>
+              <th style="padding:10px;">Performance</th>
+              <th style="padding:10px;">Accessibility</th>
+              <th style="padding:10px;">SEO</th>
+              <th style="padding:10px;">Best Practices</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${rowsHtml}
+          </tbody>
+        </table>
+
+        <h2 style="font-size:16px;margin:0 0 8px;">Regression alerts</h2>
+        ${regressionsHtml}
+
+        <p style="margin:18px 0 0;color:#4b5563;">Open your dashboard to inspect trends and prioritize fixes before rankings and conversion rates drop.</p>
+      </div>
+    `
+  });
+
+  return { delivered: true };
 }

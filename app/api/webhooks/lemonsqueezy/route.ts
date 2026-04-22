@@ -1,112 +1,130 @@
-import crypto from "crypto";
-import { NextRequest, NextResponse } from "next/server";
-import { inferPlan, upsertSubscriptionFromWebhook } from "@/lib/db";
-import { sendAccessUnlockedEmail } from "@/lib/email";
-import { setupLemonSqueezy } from "@/lib/lemonsqueezy";
+import { NextResponse } from "next/server";
+import Stripe from "stripe";
+
+import {
+  PlanType,
+  SubscriberStatus,
+  upsertSubscriber,
+  updateSubscriberStatus,
+  updateSubscriberStatusByCustomerId
+} from "@/lib/db";
 
 export const runtime = "nodejs";
 
-type LemonPayload = {
-  meta?: {
-    event_name?: string;
-    custom_data?: {
-      email?: string;
-    };
-  };
-  data?: {
-    id?: string;
-    attributes?: Record<string, unknown>;
-  };
-};
+function derivePlanFromAmount(amountTotal: number | null | undefined): PlanType {
+  if (!amountTotal) {
+    return "starter";
+  }
 
-function getString(value: unknown) {
-  return typeof value === "string" ? value : undefined;
+  return amountTotal >= 2900 ? "agency" : "starter";
 }
 
-function verifySignature(rawBody: string, signature: string, secret: string) {
-  const digest = crypto.createHmac("sha256", secret).update(rawBody).digest("hex");
-  return crypto.timingSafeEqual(Buffer.from(digest), Buffer.from(signature));
+function toLocalStatus(stripeStatus: string | null | undefined): SubscriberStatus {
+  if (!stripeStatus) {
+    return "inactive";
+  }
+
+  if (stripeStatus === "active" || stripeStatus === "trialing") {
+    return stripeStatus;
+  }
+
+  return "canceled";
 }
 
-function inferSubscriptionStatus(eventName: string, payloadStatus?: string) {
-  if (eventName === "order_created") return "active";
-  if (eventName === "subscription_created") return payloadStatus ?? "active";
-  if (eventName === "subscription_updated") return payloadStatus ?? "active";
-  if (eventName === "subscription_resumed") return "active";
-  if (eventName === "subscription_cancelled") return "inactive";
-  if (eventName === "subscription_expired") return "inactive";
-  if (eventName === "subscription_paused") return "inactive";
-  return payloadStatus ?? "inactive";
-}
+export async function POST(request: Request) {
+  const signature = request.headers.get("stripe-signature");
+  const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
+  const stripeSecretKey = process.env.STRIPE_SECRET_KEY;
 
-export async function POST(request: NextRequest) {
-  setupLemonSqueezy();
-
-  const webhookSecret = process.env.LEMON_SQUEEZY_WEBHOOK_SECRET;
-  if (!webhookSecret) {
-    return NextResponse.json({ error: "Missing LEMON_SQUEEZY_WEBHOOK_SECRET." }, { status: 500 });
+  if (!signature || !webhookSecret || !stripeSecretKey) {
+    return NextResponse.json({ error: "Missing Stripe webhook configuration." }, { status: 500 });
   }
 
-  const rawBody = await request.text();
-  const signature = request.headers.get("x-signature");
+  const stripe = new Stripe(stripeSecretKey);
+  const body = await request.text();
 
-  if (!signature) {
-    return NextResponse.json({ error: "Missing webhook signature." }, { status: 401 });
-  }
-
+  let event: Stripe.Event;
   try {
-    if (!verifySignature(rawBody, signature, webhookSecret)) {
-      return NextResponse.json({ error: "Invalid signature." }, { status: 401 });
-    }
-  } catch {
-    return NextResponse.json({ error: "Invalid signature format." }, { status: 401 });
-  }
-
-  let payload: LemonPayload;
-  try {
-    payload = JSON.parse(rawBody) as LemonPayload;
-  } catch {
-    return NextResponse.json({ error: "Malformed webhook payload." }, { status: 400 });
-  }
-
-  try {
-    const eventName = payload.meta?.event_name ?? "";
-    const attributes = payload.data?.attributes ?? {};
-
-    const email =
-      getString(attributes.user_email) ??
-      getString(attributes.customer_email) ??
-      getString(attributes.email) ??
-      getString(payload.meta?.custom_data?.email);
-
-    if (!email) {
-      return NextResponse.json({ ignored: true, reason: "No email present in webhook payload." });
-    }
-
-    const variantName =
-      getString(attributes.variant_name) ??
-      getString(attributes.product_name) ??
-      getString(attributes.first_order_item_name);
-
-    const user = await upsertSubscriptionFromWebhook({
-      email,
-      plan: inferPlan(variantName),
-      subscriptionStatus: inferSubscriptionStatus(eventName, getString(attributes.status)),
-      lemonCustomerId: getString(attributes.customer_id),
-      lemonSubscriptionId: getString(payload.data?.id)
-    });
-
-    if (user.subscription_status === "active" || user.subscription_status === "on_trial" || user.subscription_status === "paid") {
-      const dashboardUrl = `${process.env.NEXT_PUBLIC_APP_URL ?? "https://lighthouse-on-cron.com"}/dashboard`;
-      await sendAccessUnlockedEmail({
-        to: user.email,
-        dashboardUrl
-      });
-    }
-
-    return NextResponse.json({ ok: true });
+    event = stripe.webhooks.constructEvent(body, signature, webhookSecret);
   } catch (error) {
-    const message = error instanceof Error ? error.message : "Unknown webhook processing error.";
-    return NextResponse.json({ error: message }, { status: 500 });
+    return NextResponse.json(
+      {
+        error: error instanceof Error ? error.message : "Webhook signature verification failed."
+      },
+      { status: 400 }
+    );
+  }
+
+  try {
+    switch (event.type) {
+      case "checkout.session.completed": {
+        const session = event.data.object as Stripe.Checkout.Session;
+        const email = session.customer_details?.email ?? session.customer_email;
+
+        if (email) {
+          upsertSubscriber({
+            email,
+            status: "active",
+            plan: derivePlanFromAmount(session.amount_total),
+            stripeCustomerId: typeof session.customer === "string" ? session.customer : null,
+            stripeSubscriptionId:
+              typeof session.subscription === "string" ? session.subscription : null
+          });
+        }
+
+        break;
+      }
+
+      case "customer.subscription.updated":
+      case "customer.subscription.deleted": {
+        const subscription = event.data.object as Stripe.Subscription;
+        const customerId =
+          typeof subscription.customer === "string" ? subscription.customer : subscription.customer.id;
+
+        if (customerId) {
+          updateSubscriberStatusByCustomerId(customerId, toLocalStatus(subscription.status));
+        }
+
+        break;
+      }
+
+      case "invoice.payment_failed": {
+        const invoice = event.data.object as Stripe.Invoice;
+        const customerId =
+          typeof invoice.customer === "string" ? invoice.customer : invoice.customer?.id;
+
+        if (customerId) {
+          updateSubscriberStatusByCustomerId(customerId, "inactive");
+        }
+
+        break;
+      }
+
+      case "invoice.paid": {
+        const invoice = event.data.object as Stripe.Invoice;
+        const customerId =
+          typeof invoice.customer === "string" ? invoice.customer : invoice.customer?.id;
+
+        if (customerId) {
+          updateSubscriberStatusByCustomerId(customerId, "active");
+        } else if (invoice.customer_email) {
+          updateSubscriberStatus(invoice.customer_email, "active");
+        }
+
+        break;
+      }
+
+      default:
+        break;
+    }
+
+    return NextResponse.json({ received: true });
+  } catch (error) {
+    return NextResponse.json(
+      {
+        error: error instanceof Error ? error.message : "Webhook processing failed."
+      },
+      { status: 500 }
+    );
   }
 }

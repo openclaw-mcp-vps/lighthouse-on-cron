@@ -1,130 +1,161 @@
 import Link from "next/link";
-import { Bolt, ChartNoAxesColumnIncreasing, Mail, Search, ShieldAlert } from "lucide-react";
-import { Pricing } from "@/components/pricing";
 
-const faq = [
+import { Pricing } from "@/components/pricing";
+import { Badge } from "@/components/ui/badge";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+
+const painPoints = [
+  "Manual Lighthouse checks happen only when something already broke.",
+  "SEO and conversion regressions hide in page-level changes for weeks.",
+  "Agencies lose hours collecting screenshots and writing Monday update emails."
+];
+
+const outcomes = [
+  "Weekly Sunday audits for every tracked URL",
+  "Email summary with perf, a11y, SEO, and best-practices deltas",
+  "Regression alerts when scores dip vs last week",
+  "Dashboard timeline that highlights where to fix first"
+];
+
+const faqs = [
   {
-    question: "How often do audits run?",
+    question: "How does billing work?",
     answer:
-      "Every active URL is audited each Sunday in mobile mode. You get one consolidated email with score changes and regression alerts compared to the previous run."
+      "Billing runs through Stripe hosted checkout. Subscribe once, and your weekly reports start automatically from the next Sunday run."
   },
   {
     question: "What counts as a regression alert?",
     answer:
-      "A metric drop of 5 or more points in performance, accessibility, SEO, or best practices triggers an alert in your dashboard and weekly email."
+      "By default, a drop of 5+ points in any Lighthouse category is flagged so you can investigate before rankings or conversions slide."
   },
   {
-    question: "Can I track client domains on one account?",
+    question: "Can agencies monitor multiple client sites?",
     answer:
-      "Yes. Agencies typically choose Unlimited to track landing pages and core templates for each client domain without URL caps."
+      "Yes. The Agency plan is designed for unlimited URLs, making it practical for multi-client SEO and performance operations."
   },
   {
-    question: "Do I need to install anything on my site?",
+    question: "Do I need to install anything?",
     answer:
-      "No script and no plugin. We run Lighthouse remotely on the URLs you add and store historical scores for trend monitoring."
+      "No browser extension or plugin needed. Add your URLs once, then reviews and alerts are delivered automatically each week."
   }
 ];
 
 export default function HomePage() {
+  const paymentLink = process.env.NEXT_PUBLIC_STRIPE_PAYMENT_LINK as string;
+
   return (
-    <main className="mx-auto w-full max-w-6xl px-5 pb-24 pt-10 md:px-8">
-      <header className="reveal-up rounded-2xl border border-[#2f3947] bg-[#111826cc] p-6 md:p-10">
-        <div className="inline-flex items-center gap-2 rounded-full border border-[#2ea04366] bg-[#2ea0431f] px-3 py-1 text-xs font-semibold text-[#8ae2a0]">
-          <Bolt size={14} />
-          Lighthouse on Cron
-        </div>
-        <h1 className="mt-4 max-w-3xl text-3xl font-bold leading-tight md:text-5xl">
-          Weekly Core Web Vitals reports for all your URLs
+    <main className="mx-auto min-h-screen max-w-6xl px-4 pb-24 pt-10 sm:px-6">
+      <header className="flex items-center justify-between">
+        <Link href="/" className="text-sm font-semibold tracking-widest text-zinc-300">
+          LIGHTHOUSE ON CRON
+        </Link>
+        <nav className="flex items-center gap-4 text-sm text-zinc-400">
+          <a href="#pricing" className="hover:text-zinc-200">
+            Pricing
+          </a>
+          <a href="#faq" className="hover:text-zinc-200">
+            FAQ
+          </a>
+          <Link href="/dashboard" className="hover:text-zinc-200">
+            Dashboard
+          </Link>
+        </nav>
+      </header>
+
+      <section className="relative overflow-hidden py-16 sm:py-24">
+        <div className="pointer-events-none absolute -right-16 top-8 h-72 w-72 rounded-full bg-blue-500/20 blur-3xl" />
+        <Badge className="mb-5">Built for SEO-focused founders and agencies</Badge>
+        <h1 className="max-w-4xl text-4xl font-bold leading-tight text-zinc-50 sm:text-6xl">
+          Lighthouse on Cron — weekly Core Web Vitals reports for all your URLs
         </h1>
-        <p className="mt-4 max-w-3xl text-base text-muted md:text-lg">
-          Paste URLs or connect domains. Every Sunday you get Lighthouse scores for performance, accessibility, SEO, and
-          best practices, plus alerts when scores regress vs last week.
+        <p className="mt-6 max-w-3xl text-lg text-zinc-300">
+          Paste your URLs once. Every Sunday, get an email with Lighthouse scores for performance,
+          accessibility, SEO, and best practices, plus clear regression alerts against last week.
         </p>
-        <div className="mt-7 flex flex-wrap items-center gap-3">
+        <div className="mt-8 flex flex-col gap-3 sm:flex-row">
           <a
-            href="#pricing"
-            className="rounded-xl bg-[#2ea043] px-5 py-2.5 text-sm font-semibold text-[#04110a] transition hover:bg-[#3fb950]"
+            href={paymentLink}
+            className="inline-flex h-11 items-center justify-center rounded-md bg-blue-500 px-6 text-sm font-semibold text-white transition hover:bg-blue-400"
           >
-            Start for $9/mo
+            Start monitoring with Stripe Checkout
           </a>
           <Link
             href="/dashboard"
-            className="rounded-xl border border-[#2f3947] px-5 py-2.5 text-sm font-semibold text-[#f0f6fc] transition hover:bg-[#161b22]"
+            className="inline-flex h-11 items-center justify-center rounded-md border border-zinc-700 px-6 text-sm font-semibold text-zinc-200 transition hover:bg-zinc-900"
+          >
+            See dashboard flow
+          </Link>
+        </div>
+      </section>
+
+      <section className="grid gap-6 py-10 md:grid-cols-3">
+        {painPoints.map((item) => (
+          <Card key={item}>
+            <CardHeader>
+              <CardTitle className="text-lg">The problem</CardTitle>
+            </CardHeader>
+            <CardContent>
+              <p className="text-sm text-zinc-300">{item}</p>
+            </CardContent>
+          </Card>
+        ))}
+      </section>
+
+      <section className="py-12">
+        <div className="mb-8 max-w-3xl">
+          <h2 className="text-3xl font-bold text-zinc-50">What you get every week</h2>
+          <p className="mt-3 text-zinc-400">
+            Google does this kind of monitoring for top sites. Lighthouse on Cron gives smaller teams the
+            same continuous visibility for a fraction of the cost.
+          </p>
+        </div>
+        <div className="grid gap-4 sm:grid-cols-2">
+          {outcomes.map((item) => (
+            <div key={item} className="rounded-lg border border-zinc-800 bg-zinc-900/70 p-5 text-zinc-200">
+              {item}
+            </div>
+          ))}
+        </div>
+      </section>
+
+      <Pricing />
+
+      <section id="faq" className="py-16">
+        <div className="mb-8">
+          <h2 className="text-3xl font-bold text-zinc-50">FAQ</h2>
+        </div>
+        <div className="space-y-4">
+          {faqs.map((faq) => (
+            <Card key={faq.question}>
+              <CardHeader>
+                <CardTitle className="text-lg">{faq.question}</CardTitle>
+              </CardHeader>
+              <CardContent>
+                <p className="text-sm text-zinc-300">{faq.answer}</p>
+              </CardContent>
+            </Card>
+          ))}
+        </div>
+      </section>
+
+      <section className="rounded-2xl border border-zinc-800 bg-zinc-900/70 p-8 text-center">
+        <h3 className="text-2xl font-bold text-zinc-50">Stop guessing if your site got slower this week</h3>
+        <p className="mx-auto mt-3 max-w-2xl text-zinc-400">
+          For $9/month, Lighthouse on Cron gives you a repeatable performance workflow instead of a manual chore.
+        </p>
+        <div className="mt-6 flex flex-col justify-center gap-3 sm:flex-row">
+          <a
+            href={paymentLink}
+            className="inline-flex h-11 items-center justify-center rounded-md bg-blue-500 px-6 text-sm font-semibold text-white transition hover:bg-blue-400"
+          >
+            Start now
+          </a>
+          <Link
+            href="/dashboard"
+            className="inline-flex h-11 items-center justify-center rounded-md border border-zinc-700 px-6 text-sm font-semibold text-zinc-200 transition hover:bg-zinc-900"
           >
             Open dashboard
           </Link>
-        </div>
-      </header>
-
-      <section className="mt-10 grid gap-4 md:grid-cols-3">
-        <article className="panel p-5">
-          <div className="mb-3 inline-flex rounded-lg bg-[#f8514922] p-2 text-[#fda8a3]">
-            <ShieldAlert size={18} />
-          </div>
-          <h2 className="text-lg font-semibold">The problem</h2>
-          <p className="mt-2 text-sm text-muted">
-            Manual Lighthouse checks get skipped. Regressions slip through after content edits, app updates, or plugin installs.
-          </p>
-        </article>
-        <article className="panel p-5">
-          <div className="mb-3 inline-flex rounded-lg bg-[#d2992222] p-2 text-[#f2cc60]">
-            <Search size={18} />
-          </div>
-          <h2 className="text-lg font-semibold">The opportunity</h2>
-          <p className="mt-2 text-sm text-muted">
-            Faster pages rank and convert better. Weekly audits catch drops before they become SEO losses or checkout friction.
-          </p>
-        </article>
-        <article className="panel p-5">
-          <div className="mb-3 inline-flex rounded-lg bg-[#2ea04322] p-2 text-[#8ae2a0]">
-            <Mail size={18} />
-          </div>
-          <h2 className="text-lg font-semibold">The workflow</h2>
-          <p className="mt-2 text-sm text-muted">
-            Add URLs once. We run every Sunday and email a concise report with score changes, regressions, and priorities.
-          </p>
-        </article>
-      </section>
-
-      <section className="mt-14 panel p-6 md:p-8">
-        <h2 className="text-2xl font-semibold">Why people pay for this</h2>
-        <p className="mt-3 max-w-3xl text-muted">
-          Google tracks top sites at scale, but indie products and agency client pages are left to manual checks. At $9/month,
-          automating Lighthouse with regression alerts removes a recurring chore and prevents expensive blind spots.
-        </p>
-        <div className="mt-6 grid gap-4 md:grid-cols-2">
-          <div className="rounded-xl border border-[#2f3947] bg-[#0f141b] p-4">
-            <h3 className="inline-flex items-center gap-2 text-base font-semibold">
-              <ChartNoAxesColumnIncreasing size={17} /> SEO-focused founders
-            </h3>
-            <p className="mt-2 text-sm text-muted">
-              Track launch pages, docs, and pricing pages weekly so rank and speed don’t decay unnoticed.
-            </p>
-          </div>
-          <div className="rounded-xl border border-[#2f3947] bg-[#0f141b] p-4">
-            <h3 className="inline-flex items-center gap-2 text-base font-semibold">
-              <ChartNoAxesColumnIncreasing size={17} /> Growth and web agencies
-            </h3>
-            <p className="mt-2 text-sm text-muted">
-              Watch every client’s key URLs from one dashboard, then use alerts to prioritize technical fixes before review calls.
-            </p>
-          </div>
-        </div>
-      </section>
-
-      <section className="mt-14">
-        <Pricing />
-      </section>
-
-      <section className="mt-14 panel p-6 md:p-8" id="faq">
-        <h2 className="text-2xl font-semibold">FAQ</h2>
-        <div className="mt-6 space-y-4">
-          {faq.map((item) => (
-            <article key={item.question} className="rounded-xl border border-[#2f3947] bg-[#0f141b] p-4">
-              <h3 className="text-base font-semibold">{item.question}</h3>
-              <p className="mt-2 text-sm text-muted">{item.answer}</p>
-            </article>
-          ))}
         </div>
       </section>
     </main>

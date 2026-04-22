@@ -1,157 +1,164 @@
 import { NextRequest, NextResponse } from "next/server";
-import {
-  getLastCronWeek,
-  getPreviousAuditBeforeWeek,
-  getWeeklyCronTargets,
-  setLastCronWeek,
-  upsertAuditRun
-} from "@/lib/db";
+
 import { sendWeeklyReportEmail } from "@/lib/email";
+import {
+  getLatestAuditForUrl,
+  isSubscriberActive,
+  listActiveSubscribers,
+  listMonitoredUrls,
+  saveAuditSnapshot
+} from "@/lib/db";
 import { runLighthouseAudit } from "@/lib/lighthouse";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-const REGRESSION_THRESHOLD = -5;
+const REGRESSION_THRESHOLD = 5;
 
-function getCurrentWeekKey(date: Date) {
-  const year = date.getUTCFullYear();
-  const month = `${date.getUTCMonth() + 1}`.padStart(2, "0");
-  const day = `${date.getUTCDate()}`.padStart(2, "0");
-  return `${year}-${month}-${day}`;
+function getRunWeek(date: Date) {
+  const run = new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate()));
+  const day = run.getUTCDay();
+  run.setUTCDate(run.getUTCDate() - day);
+  return run.toISOString().slice(0, 10);
 }
 
-function formatWeekLabel(weekKey: string) {
-  return new Date(`${weekKey}T00:00:00.000Z`).toLocaleDateString("en-US", {
-    year: "numeric",
-    month: "long",
-    day: "numeric",
-    timeZone: "UTC"
-  });
-}
-
-function buildAlerts(
-  current: { performance: number; accessibility: number; seo: number; bestPractices: number },
-  previous: { performance: number; accessibility: number; seo: number; bestPractices: number } | null
-) {
-  if (!previous) {
-    return [];
+function isAuthorized(request: NextRequest) {
+  const configuredSecret = process.env.CRON_SECRET;
+  if (!configuredSecret) {
+    return true;
   }
 
-  const alerts: string[] = [];
-  if (current.performance - previous.performance <= REGRESSION_THRESHOLD) alerts.push("Performance dropped 5+ points");
-  if (current.accessibility - previous.accessibility <= REGRESSION_THRESHOLD)
-    alerts.push("Accessibility dropped 5+ points");
-  if (current.seo - previous.seo <= REGRESSION_THRESHOLD) alerts.push("SEO dropped 5+ points");
-  if (current.bestPractices - previous.bestPractices <= REGRESSION_THRESHOLD)
-    alerts.push("Best practices dropped 5+ points");
-  return alerts;
+  const auth = request.headers.get("authorization");
+  const xSecret = request.headers.get("x-cron-secret");
+
+  return auth === `Bearer ${configuredSecret}` || xSecret === configuredSecret;
+}
+
+function scoreDelta(current: number, previous: number | null) {
+  if (previous === null) return null;
+  return Math.round((current - previous) * 10) / 10;
 }
 
 export async function GET(request: NextRequest) {
-  return runCron(request);
-}
-
-export async function POST(request: NextRequest) {
-  return runCron(request);
-}
-
-async function runCron(request: NextRequest) {
-  const cronSecret = process.env.CRON_SECRET;
-  if (cronSecret) {
-    const authHeader = request.headers.get("authorization");
-    if (authHeader !== `Bearer ${cronSecret}`) {
-      return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
-    }
+  if (!isAuthorized(request)) {
+    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
-  const now = new Date();
   const force = request.nextUrl.searchParams.get("force") === "1";
+  const now = new Date();
 
   if (!force && now.getUTCDay() !== 0) {
-    return NextResponse.json({ ok: true, skipped: true, reason: "Cron runs on Sunday UTC." });
+    return NextResponse.json({
+      skipped: true,
+      reason: "Lighthouse weekly cron runs on Sunday UTC.",
+      today: now.toISOString().slice(0, 10)
+    });
   }
 
-  const weekKey = getCurrentWeekKey(now);
-  const lastWeek = await getLastCronWeek();
-  if (!force && lastWeek === weekKey) {
-    return NextResponse.json({ ok: true, skipped: true, reason: "Already processed this week." });
-  }
+  const runWeek = getRunWeek(now);
+  const subscribers = listActiveSubscribers().filter((entry) => isSubscriberActive(entry.status));
 
-  const targets = await getWeeklyCronTargets();
-  if (targets.length === 0) {
-    await setLastCronWeek(weekKey);
-    return NextResponse.json({ ok: true, skipped: true, reason: "No active URLs." });
-  }
+  let processedSubscribers = 0;
+  let processedUrls = 0;
+  const errors: string[] = [];
 
-  let auditedCount = 0;
-  let failedCount = 0;
+  for (const subscriber of subscribers) {
+    const targets = listMonitoredUrls(subscriber.email);
+    if (targets.length === 0) {
+      continue;
+    }
 
-  for (const user of targets) {
-    const emailReports: Array<{
+    const rows: {
       url: string;
-      current: {
-        performance: number;
-        accessibility: number;
-        seo: number;
-        bestPractices: number;
-      };
-      previous: {
-        performance: number;
-        accessibility: number;
-        seo: number;
-        bestPractices: number;
-      } | null;
-      regressionAlerts: string[];
-    }> = [];
+      performance: number;
+      accessibility: number;
+      seo: number;
+      bestPractices: number;
+      performanceDelta: number | null;
+      accessibilityDelta: number | null;
+      seoDelta: number | null;
+      bestPracticesDelta: number | null;
+    }[] = [];
 
-    for (const target of user.urls) {
+    const regressions: string[] = [];
+
+    for (const target of targets) {
       try {
-        const [audit, previous] = await Promise.all([
-          runLighthouseAudit(target.url),
-          getPreviousAuditBeforeWeek(target.trackedUrlId, weekKey)
-        ]);
+        const previous = getLatestAuditForUrl(target.id);
+        const result = await runLighthouseAudit(target.url);
 
-        await upsertAuditRun({
-          trackedUrlId: target.trackedUrlId,
-          runWeek: weekKey,
-          performance: audit.scores.performance,
-          accessibility: audit.scores.accessibility,
-          seo: audit.scores.seo,
-          bestPractices: audit.scores.bestPractices,
-          rawJson: audit.report
+        saveAuditSnapshot({
+          monitoredUrlId: target.id,
+          runWeek,
+          performance: result.performance,
+          accessibility: result.accessibility,
+          seo: result.seo,
+          bestPractices: result.bestPractices,
+          lcp: result.lcp,
+          cls: result.cls,
+          tbt: result.tbt,
+          fcp: result.fcp,
+          speedIndex: result.speedIndex,
+          rawJson: result.rawJson
         });
 
-        const regressionAlerts = buildAlerts(audit.scores, previous);
-        emailReports.push({
+        const performanceDelta = scoreDelta(result.performance, previous?.performance ?? null);
+        const accessibilityDelta = scoreDelta(result.accessibility, previous?.accessibility ?? null);
+        const seoDelta = scoreDelta(result.seo, previous?.seo ?? null);
+        const bestPracticesDelta = scoreDelta(result.bestPractices, previous?.bestPractices ?? null);
+
+        rows.push({
           url: target.url,
-          current: audit.scores,
-          previous,
-          regressionAlerts
+          performance: result.performance,
+          accessibility: result.accessibility,
+          seo: result.seo,
+          bestPractices: result.bestPractices,
+          performanceDelta,
+          accessibilityDelta,
+          seoDelta,
+          bestPracticesDelta
         });
-        auditedCount += 1;
+
+        if (performanceDelta !== null && performanceDelta <= -REGRESSION_THRESHOLD) {
+          regressions.push(`${target.url}: performance dropped ${Math.abs(performanceDelta).toFixed(1)} points`);
+        }
+        if (accessibilityDelta !== null && accessibilityDelta <= -REGRESSION_THRESHOLD) {
+          regressions.push(
+            `${target.url}: accessibility dropped ${Math.abs(accessibilityDelta).toFixed(1)} points`
+          );
+        }
+        if (seoDelta !== null && seoDelta <= -REGRESSION_THRESHOLD) {
+          regressions.push(`${target.url}: SEO dropped ${Math.abs(seoDelta).toFixed(1)} points`);
+        }
+        if (bestPracticesDelta !== null && bestPracticesDelta <= -REGRESSION_THRESHOLD) {
+          regressions.push(
+            `${target.url}: best practices dropped ${Math.abs(bestPracticesDelta).toFixed(1)} points`
+          );
+        }
+
+        processedUrls += 1;
       } catch (error) {
-        failedCount += 1;
-        console.error(`Lighthouse audit failed for ${target.url}`, error);
+        errors.push(
+          `${target.url}: ${error instanceof Error ? error.message : "Lighthouse run failed for unknown reason."}`
+        );
       }
     }
 
-    if (emailReports.length > 0) {
+    if (rows.length > 0) {
       await sendWeeklyReportEmail({
-        email: user.email,
-        weekLabel: formatWeekLabel(weekKey),
-        reports: emailReports
+        email: subscriber.email,
+        runWeek,
+        rows,
+        regressions
       });
+      processedSubscribers += 1;
     }
   }
 
-  await setLastCronWeek(weekKey);
-
   return NextResponse.json({
-    ok: true,
-    week: weekKey,
-    usersProcessed: targets.length,
-    auditedCount,
-    failedCount
+    processedSubscribers,
+    processedUrls,
+    runWeek,
+    errors
   });
 }
